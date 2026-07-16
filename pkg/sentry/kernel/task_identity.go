@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/unique_name_landlock"
 )
 
 // Credentials returns t's credentials.
@@ -529,4 +530,26 @@ func (t *Task) ClearAmbientCapabilities() {
 	creds := t.Credentials().Fork()
 	creds.AmbientCaps = 0
 	t.creds.Store(creds)
+}
+
+// RestrictLandlock enforces a Landlock ruleset on the task.
+func (t *Task) RestrictLandlock(ruleset *unique_name_landlock.Ruleset) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	creds := t.Credentials()
+	var oldDomain *unique_name_landlock.Domain
+	if creds.LandlockDomain != nil {
+		oldDomain = creds.LandlockDomain.(*unique_name_landlock.Domain)
+	}
+
+	newDomain, err := unique_name_landlock.Merge(oldDomain, ruleset)
+	if err != nil {
+		return err
+	}
+
+	newCreds := creds.Fork()
+	newCreds.LandlockDomain = newDomain
+	t.creds.Store(newCreds)
+	return nil
 }

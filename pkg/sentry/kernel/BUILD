@@ -417,6 +417,7 @@ go_library(
         "//pkg/sentry/time",
         "//pkg/sentry/unimpl",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
+        "//pkg/sentry/unique_name_landlock",
         "//pkg/sentry/uniqueid",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",

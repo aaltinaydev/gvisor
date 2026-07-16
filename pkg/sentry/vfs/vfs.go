@@ -306,6 +306,42 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 		return err
 	}
 
+	if creds.LandlockDomain != nil {
+		oldParentPop := *oldpop
+		oldParentPop.Path = fspath.Parse(path.Dir(oldpop.Path.String()))
+		oldParentVD, err := vfs.GetDentryAt(ctx, creds, &oldParentPop, &GetDentryOptions{})
+		if err != nil {
+			oldVD.DecRef(ctx)
+			return err
+		}
+		defer oldParentVD.DecRef(ctx)
+
+		newParentPop := *newpop
+		newParentPop.Path = fspath.Parse(path.Dir(newpop.Path.String()))
+		newParentVD, err := vfs.GetDentryAt(ctx, creds, &newParentPop, &GetDentryOptions{})
+		if err != nil {
+			oldVD.DecRef(ctx)
+			return err
+		}
+		defer newParentVD.DecRef(ctx)
+
+		if oldParentVD.mount == newParentVD.mount && oldParentVD.dentry == newParentVD.dentry {
+			stat, err := vfs.StatAt(ctx, creds, oldpop, &StatOptions{})
+			if err != nil {
+				oldVD.DecRef(ctx)
+				return err
+			}
+			mask := getModeAccess(uint32(stat.Mode))
+			if err := vfs.checkLandlock(ctx, creds, newParentVD, mask); err != nil {
+				oldVD.DecRef(ctx)
+				return err
+			}
+		} else {
+			oldVD.DecRef(ctx)
+			return linuxerr.EXDEV
+		}
+	}
+
 	if !newpop.Path.Begin.Ok() {
 		oldVD.DecRef(ctx)
 		if newpop.Path.Absolute {
@@ -344,6 +380,21 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 
 // MkdirAt creates a directory at the given path.
 func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *MkdirOptions) error {
+	if creds.LandlockDomain != nil {
+		parentPop := *pop
+		parentPop.Path = fspath.Parse(path.Dir(pop.Path.String()))
+		parentVD, err := vfs.GetDentryAt(ctx, creds, &parentPop, &GetDentryOptions{})
+		if err == nil {
+			err = vfs.checkLandlock(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_DIR)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+			return err
+		}
+	}
+
 	if !pop.Path.Begin.Ok() {
 		// pop.Path should not be empty in operations that create/delete files.
 		// This is consistent with mkdirat(dirfd, "", mode).
@@ -384,6 +435,37 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 // MknodAt creates a file of the given mode at the given path. It returns an
 // error from the linuxerr package.
 func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *MknodOptions) error {
+	if creds.LandlockDomain != nil {
+		var mask uint64
+		switch opts.Mode & linux.S_IFMT {
+		case linux.S_IFREG, 0:
+			mask = linux.LANDLOCK_ACCESS_FS_MAKE_REG
+		case linux.S_IFCHR:
+			mask = linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
+		case linux.S_IFBLK:
+			mask = linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
+		case linux.S_IFIFO:
+			mask = linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
+		case linux.S_IFSOCK:
+			mask = linux.LANDLOCK_ACCESS_FS_MAKE_SOCK
+		default:
+			return linuxerr.EINVAL
+		}
+
+		parentPop := *pop
+		parentPop.Path = fspath.Parse(path.Dir(pop.Path.String()))
+		parentVD, err := vfs.GetDentryAt(ctx, creds, &parentPop, &GetDentryOptions{})
+		if err == nil {
+			err = vfs.checkLandlock(ctx, creds, parentVD, mask)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+			return err
+		}
+	}
+
 	if !pop.Path.Begin.Ok() {
 		// pop.Path should not be empty in operations that create/delete files.
 		// This is consistent with mknodat(dirfd, "", mode, dev).
@@ -462,6 +544,44 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 	if opts.Flags&linux.O_PATH != 0 {
 		return vfs.openOPathFD(ctx, creds, pop, opts.Flags)
 	}
+
+	if creds.LandlockDomain != nil {
+		if opts.Flags&linux.O_CREAT != 0 {
+			vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+			if err == nil {
+				vd.DecRef(ctx)
+			} else if linuxerr.Equals(linuxerr.ENOENT, err) {
+				parentPop := *pop
+				parentPop.Path = fspath.Parse(path.Dir(pop.Path.String()))
+				parentVD, err := vfs.GetDentryAt(ctx, creds, &parentPop, &GetDentryOptions{})
+				if err == nil {
+					err = vfs.checkLandlock(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_REG)
+					parentVD.DecRef(ctx)
+					if err != nil {
+						return nil, err
+					}
+				} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+					return nil, err
+				}
+			} else {
+				return nil, err
+			}
+		}
+
+		if opts.Flags&linux.O_TRUNC != 0 {
+			vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+			if err == nil {
+				err = vfs.checkLandlock(ctx, creds, vd, linux.LANDLOCK_ACCESS_FS_WRITE_FILE)
+				vd.DecRef(ctx)
+				if err != nil {
+					return nil, err
+				}
+			} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+				return nil, err
+			}
+		}
+	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	if opts.Flags&linux.O_DIRECTORY != 0 {
@@ -489,6 +609,11 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 					fd.DecRef(ctx)
 					return nil, linuxerr.EACCES
 				}
+			}
+
+			if err := vfs.checkOpenLandlock(ctx, creds, fd, opts.Flags); err != nil {
+				fd.DecRef(ctx)
+				return nil, err
 			}
 
 			// Linux generates IN_OPEN from do_dentry_open() inside vfs_open(),
@@ -561,6 +686,71 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 		return linuxerr.EINVAL
 	}
 
+	if creds.LandlockDomain != nil {
+		oldVD, err := vfs.GetDentryAt(ctx, creds, oldpop, &GetDentryOptions{})
+		if err != nil {
+			oldParentVD.DecRef(ctx)
+			return err
+		}
+		defer oldVD.DecRef(ctx)
+
+		newParentPop := *newpop
+		newParentPop.Path = fspath.Parse(path.Dir(newpop.Path.String()))
+		newParentVD, err := vfs.GetDentryAt(ctx, creds, &newParentPop, &GetDentryOptions{})
+		if err != nil {
+			oldParentVD.DecRef(ctx)
+			return err
+		}
+		defer newParentVD.DecRef(ctx)
+
+		if oldParentVD.mount == newParentVD.mount && oldParentVD.dentry == newParentVD.dentry {
+			stat, err := vfs.StatAt(ctx, creds, oldpop, &StatOptions{})
+			if err != nil {
+				oldParentVD.DecRef(ctx)
+				return err
+			}
+			sourceMask := getModeAccess(uint32(stat.Mode))
+
+			var removeMask uint64
+			if stat.Mode&linux.S_IFMT == linux.S_IFDIR {
+				removeMask = linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+			} else {
+				removeMask = linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
+			}
+
+			if err := vfs.checkLandlock(ctx, creds, newParentVD, sourceMask|removeMask); err != nil {
+				oldParentVD.DecRef(ctx)
+				return err
+			}
+
+			destVD, err := vfs.GetDentryAt(ctx, creds, newpop, &GetDentryOptions{})
+			if err == nil {
+				defer destVD.DecRef(ctx)
+				destStat, err := vfs.StatAt(ctx, creds, newpop, &StatOptions{})
+				if err != nil {
+					oldParentVD.DecRef(ctx)
+					return err
+				}
+				var destRemoveMask uint64
+				if destStat.Mode&linux.S_IFMT == linux.S_IFDIR {
+					destRemoveMask = linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+				} else {
+					destRemoveMask = linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
+				}
+				if err := vfs.checkLandlock(ctx, creds, newParentVD, destRemoveMask); err != nil {
+					oldParentVD.DecRef(ctx)
+					return err
+				}
+			} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+				oldParentVD.DecRef(ctx)
+				return err
+			}
+		} else {
+			oldParentVD.DecRef(ctx)
+			return linuxerr.EXDEV
+		}
+	}
+
 	rp := vfs.getResolvingPath(creds, newpop)
 	defer rp.Release(ctx)
 	renameOpts := *opts
@@ -590,6 +780,21 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 
 // RmdirAt removes the directory at the given path.
 func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation) error {
+	if creds.LandlockDomain != nil {
+		parentPop := *pop
+		parentPop.Path = fspath.Parse(path.Dir(pop.Path.String()))
+		parentVD, err := vfs.GetDentryAt(ctx, creds, &parentPop, &GetDentryOptions{})
+		if err == nil {
+			err = vfs.checkLandlock(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+			return err
+		}
+	}
+
 	if !pop.Path.Begin.Ok() {
 		// pop.Path should not be empty in operations that create/delete files.
 		// This is consistent with unlinkat(dirfd, "", AT_REMOVEDIR).
@@ -686,6 +891,21 @@ func (vfs *VirtualFilesystem) StatFSAt(ctx context.Context, creds *auth.Credenti
 
 // SymlinkAt creates a symbolic link at the given path with the given target.
 func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, target string) error {
+	if creds.LandlockDomain != nil {
+		parentPop := *pop
+		parentPop.Path = fspath.Parse(path.Dir(pop.Path.String()))
+		parentVD, err := vfs.GetDentryAt(ctx, creds, &parentPop, &GetDentryOptions{})
+		if err == nil {
+			err = vfs.checkLandlock(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_SYM)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+			return err
+		}
+	}
+
 	if !pop.Path.Begin.Ok() {
 		// pop.Path should not be empty in operations that create/delete files.
 		// This is consistent with symlinkat(oldpath, newdirfd, "").
@@ -722,6 +942,21 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 
 // UnlinkAt deletes the non-directory file at the given path.
 func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation) error {
+	if creds.LandlockDomain != nil {
+		parentPop := *pop
+		parentPop.Path = fspath.Parse(path.Dir(pop.Path.String()))
+		parentVD, err := vfs.GetDentryAt(ctx, creds, &parentPop, &GetDentryOptions{})
+		if err == nil {
+			err = vfs.checkLandlock(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+			return err
+		}
+	}
+
 	if !pop.Path.Begin.Ok() {
 		// pop.Path should not be empty in operations that create/delete files.
 		// This is consistent with unlinkat(dirfd, "", 0).
@@ -1067,3 +1302,68 @@ func (vd VirtualDentry) Mount() *Mount {
 func (vd VirtualDentry) Dentry() *Dentry {
 	return vd.dentry
 }
+
+// LandlockDomain represents a Landlock security domain.
+// It is implemented by unique_name_landlock.Domain.
+type LandlockDomain interface {
+	CheckAccess(ctx context.Context, vfsObj *VirtualFilesystem, vd VirtualDentry, accessMask uint64) error
+}
+
+func (vfs *VirtualFilesystem) checkLandlock(ctx context.Context, creds *auth.Credentials, vd VirtualDentry, mask uint64) error {
+	if creds.LandlockDomain == nil {
+		return nil
+	}
+	dom := creds.LandlockDomain.(LandlockDomain)
+	return dom.CheckAccess(ctx, vfs, vd, mask)
+}
+
+func getModeAccess(mode uint32) uint64 {
+	switch mode & linux.S_IFMT {
+	case linux.S_IFLNK:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_SYM
+	case linux.S_IFDIR:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_DIR
+	case linux.S_IFREG:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_REG
+	case linux.S_IFSOCK:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_SOCK
+	case linux.S_IFFIFO:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
+	case linux.S_IFBLK:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
+	case linux.S_IFCHR:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
+	default:
+		return 0
+	}
+}
+
+func (vfs *VirtualFilesystem) checkOpenLandlock(ctx context.Context, creds *auth.Credentials, fd *FileDescription, flags uint32) error {
+	if creds.LandlockDomain == nil {
+		return nil
+	}
+	vd := fd.VirtualDentry()
+	stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil {
+		return err
+	}
+	var mask uint64
+	isDir := stat.Mode&linux.S_IFMT == linux.S_IFDIR
+
+	accmode := flags & linux.O_ACCMODE
+	if accmode == linux.O_RDONLY || accmode == linux.O_RDWR {
+		if isDir {
+			mask |= linux.LANDLOCK_ACCESS_FS_READ_DIR
+		} else {
+			mask |= linux.LANDLOCK_ACCESS_FS_READ_FILE
+		}
+	}
+	if accmode == linux.O_WRONLY || accmode == linux.O_RDWR {
+		if !isDir {
+			mask |= linux.LANDLOCK_ACCESS_FS_WRITE_FILE
+		}
+	}
+
+	return vfs.checkLandlock(ctx, creds, vd, mask)
+}
+

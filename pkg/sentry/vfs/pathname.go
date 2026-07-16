@@ -212,3 +212,46 @@ loop:
 //		FilesystemImpl.PrependPath() would return PrependPathAtNonMountRootError.
 //
 // These should be added as necessary.
+
+// IsBeneath returns true if vd is beneath ancestor (or is ancestor itself).
+// It handles mount crossing.
+func (vfs *VirtualFilesystem) IsBeneath(ctx context.Context, vd VirtualDentry, ancestor VirtualDentry) (bool, error) {
+	if vd.mount == ancestor.mount && vd.dentry == ancestor.dentry {
+		return true, nil
+	}
+
+	b := getFSPathBuilder()
+	defer putFSPathBuilder(b)
+	haveRef := false
+	defer func() {
+		if haveRef {
+			vd.DecRef(ctx)
+		}
+	}()
+
+	for {
+		err := vd.mount.fs.impl.PrependPath(ctx, ancestor, vd, b)
+		switch err.(type) {
+		case nil:
+			if vd.mount == ancestor.mount && vd.dentry == ancestor.dentry {
+				return true, nil
+			}
+			nextVD := vfs.getMountpointAt(ctx, vd.mount, ancestor)
+			if !nextVD.Ok() {
+				return false, nil
+			}
+			if haveRef {
+				vd.DecRef(ctx)
+			}
+			vd = nextVD
+			haveRef = true
+		case PrependPathAtVFSRootError:
+			return true, nil
+		case PrependPathAtNonMountRootError, PrependPathSyntheticError:
+			return false, nil
+		default:
+			return false, err
+		}
+	}
+}
+
