@@ -334,3 +334,9 @@ func (d *anonDentry) Watches() *Watches {
 
 // OnZeroWatches implements Dentry.OnZeroWatches.
 func (d *anonDentry) OnZeroWatches(context.Context) {}
+
+// WalkAncestors implements FilesystemImpl.WalkAncestors.
+func (fs *anonFilesystem) WalkAncestors(ctx context.Context, d *Dentry, cb func(*Dentry) bool) error {
+	cb(d)
+	return nil
+}

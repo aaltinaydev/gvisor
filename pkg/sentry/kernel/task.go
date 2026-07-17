@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -945,4 +946,21 @@ func (t *Task) SetCoredumpFilter(coredumpFilter uint32) {
 // GetCoredumpFilter returns the task's coredump filter.
 func (t *Task) GetCoredumpFilter() uint32 {
 	return t.tg.coredumpFilter.Load()
+}
+
+// UpdateCredentials updates the task's credentials and handles Landlock domain lifecycle.
+func (t *Task) UpdateCredentials(newCreds *auth.Credentials) {
+	oldCreds := t.Credentials()
+	t.creds.Store(newCreds)
+	t.onCredentialsUpdated(oldCreds, newCreds)
+}
+
+func (t *Task) onCredentialsUpdated(oldCreds, newCreds *auth.Credentials) {
+	if oldCreds != nil && oldCreds.Security != nil {
+		if rc, ok := oldCreds.Security.(interface{ DecRef(context.Context) }); ok {
+			rc.DecRef(t)
+		} else if rc, ok := oldCreds.Security.(interface{ DecRef() }); ok {
+			rc.DecRef()
+		}
+	}
 }

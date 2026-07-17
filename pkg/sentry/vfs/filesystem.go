@@ -572,3 +572,13 @@ func (PrependPathSyntheticError) Error() string {
 type HostFDProvider interface {
 	HostFD() int
 }
+
+// AncestorsWalker is implemented by FilesystemImpls that support walking up
+// the ancestry chain of a dentry while holding the necessary internal filesystem
+// locks to prevent concurrent directory rename operations.
+type AncestorsWalker interface {
+	// WalkAncestors calls cb on d and each of its ancestors in the filesystem
+	// tree in order, starting with d. If cb returns false, walking stops.
+	// The walking MUST begin at d and proceed up to the filesystem root.
+	WalkAncestors(ctx context.Context, d *Dentry, cb func(*Dentry) bool) error
+}

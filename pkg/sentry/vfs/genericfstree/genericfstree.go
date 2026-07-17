@@ -132,3 +132,16 @@ func DebugPathname(fs *Filesystem, d *Dentry) string {
 	_ = PrependPath(fs, vfs.VirtualDentry{}, nil, d, &b)
 	return b.String()
 }
+
+// WalkAncestors walks up the parent chain of d and calls cb on each dentry.
+// It acquires ancestryMu read lock for the duration of the walk.
+func WalkAncestors(fs *Filesystem, d *Dentry, cb func(*Dentry) bool) {
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
+	for curr := d; curr != nil; curr = curr.parent.Load() {
+		if !cb(curr) {
+			break
+		}
+	}
+}
+

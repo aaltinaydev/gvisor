@@ -385,7 +385,7 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	t.p.PrepareExecve()
 	// Update credentials to reflect the execve. This should precede switching
 	// MMs to ensure that dumpability has been reset first, if needed.
-	t.creds.Store(r.newCreds)
+	t.UpdateCredentials(r.newCreds)
 	t.mu.Lock()
 	oldImage := t.image
 	t.image = *r.image

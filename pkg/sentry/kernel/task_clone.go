@@ -296,6 +296,11 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	childCreds := creds
 	if userns != creds.UserNamespace {
 		childCreds = creds.ForkIntoUserNamespace(userns)
+	} else {
+		// Matches Linux kernel/cred.c:copy_creds()
+		// We always fork credentials to ensure that the SecurityObject (e.g. Landlock Domain)
+		// is cloned and its reference count is incremented, avoiding refcount underflow on task exit.
+		childCreds = creds.Fork()
 	}
 
 	cfg := &TaskConfig{
@@ -795,7 +800,7 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 	// Store replaced resources in nss so that they're cleaned up by the deferred function.
 	t.mu.Lock()
 	if nss.userNS != nil {
-		t.creds.Store(checkCreds)
+		t.UpdateCredentials(checkCreds)
 		nss.userNS = creds.UserNamespace
 	}
 	if nss.childPIDNS != nil {
@@ -953,7 +958,7 @@ func (t *Task) Unshare(flags int32) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if newCreds {
-		t.creds.Store(creds)
+		t.UpdateCredentials(creds)
 		newUserNS = originalUserNS
 	}
 	if newFSContext != nil {

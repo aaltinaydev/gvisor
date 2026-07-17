@@ -820,6 +820,8 @@ func (t *Task) UnregisterOnDestroyAction(key TaskDestroyAction) {
 }
 
 func (t *Task) execOnDestroyActions() {
+	t.UpdateCredentials(nil)
+
 	t.mu.Lock()
 	actions := t.onDestroyAction
 	t.onDestroyAction = nil

@@ -1215,3 +1215,11 @@ func (fs *Filesystem) deferDecRefVD(ctx context.Context, vd vfs.VirtualDentry) {
 		vd.DecRef(ctx)
 	}
 }
+
+// WalkAncestors implements vfs.AncestorsWalker.
+func (fs *Filesystem) WalkAncestors(ctx context.Context, d *vfs.Dentry, cb func(*vfs.Dentry) bool) error {
+	genericWalkAncestors(fs, d.Impl().(*Dentry), func(curr *Dentry) bool {
+		return cb(curr.VFSDentry())
+	})
+	return nil
+}

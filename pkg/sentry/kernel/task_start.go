@@ -232,7 +232,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		cgroup2:         cgroup2,
 	}
 	t.netns = cfg.NetworkNamespace
-	t.creds.Store(cfg.Credentials)
+	t.UpdateCredentials(cfg.Credentials)
 	t.fsContext.Store(cfg.FSContext)
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	// We don't construct t.blockingTimer until Task.run(); see that function

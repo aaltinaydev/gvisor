@@ -58,7 +58,18 @@ type Credentials struct {
 
 	// The user namespace associated with the owner of the credentials.
 	UserNamespace *UserNamespace
+
+	// Security is the security module context associated with these credentials.
+	Security SecurityObject
 }
+
+// SecurityObject defines the interface that security modules must implement if they
+// store objects in the Credentials.Security field.
+type SecurityObject interface {
+	// Clone returns a new reference or copy of the security object.
+	Clone() SecurityObject
+}
+
 
 // NewAnonymousCredentials returns a set of credentials with no capabilities in
 // any user namespace.
@@ -149,6 +160,9 @@ func NewUserCredentials(kuid KUID, kgid KGID, extraKGIDs []KGID, capabilities *T
 func (c *Credentials) Fork() *Credentials {
 	nc := new(Credentials)
 	*nc = *c // Copy-by-value; this is legal for all fields.
+	if nc.Security != nil {
+		nc.Security = nc.Security.Clone()
+	}
 	return nc
 }
 

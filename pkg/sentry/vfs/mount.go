@@ -206,6 +206,14 @@ func (mnt *Mount) neverConnected() bool {
 	return mnt.ns == nil
 }
 
+// NeverConnected returns true if the mount has never been connected to a namespace.
+// This is exported for the Landlock subsystem to identify internal filesystems
+// that should not be restricted by Landlock policies (e.g., pipefs, sockfs).
+// Matches gVisor pkg/sentry/vfs/mount.go:neverConnected()
+func (mnt *Mount) NeverConnected() bool {
+	return mnt.neverConnected()
+}
+
 // coveringMount returns a mount that completely covers mnt if it exists and nil
 // otherwise. A mount that covers another is one that is the only child of its
 // parent and whose mountpoint is its parent's root.

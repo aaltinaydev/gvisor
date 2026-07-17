@@ -1170,3 +1170,12 @@ func parseSize(s string) (uint64, bool, error) {
 	}
 	return bytes, percentageUsed, err
 }
+
+// WalkAncestors implements vfs.AncestorsWalker.
+func (fs *filesystem) WalkAncestors(ctx context.Context, d *vfs.Dentry, cb func(*vfs.Dentry) bool) error {
+	genericWalkAncestors(fs, d.Impl().(*dentry), func(curr *dentry) bool {
+		return cb(&curr.vfsd)
+	})
+	return nil
+}
+

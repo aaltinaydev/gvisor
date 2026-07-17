@@ -2392,3 +2392,11 @@ func (rp *resolvingPath) copy() resolvingPath {
 func (rp *resolvingPath) getComponents(emit func(string) bool) {
 	rp.GetComponents(rp.excludeLast, emit)
 }
+
+// WalkAncestors implements vfs.AncestorsWalker.
+func (fs *filesystem) WalkAncestors(ctx context.Context, d *vfs.Dentry, cb func(*vfs.Dentry) bool) error {
+	genericWalkAncestors(fs, d.Impl().(*dentry), func(curr *dentry) bool {
+		return cb(&curr.vfsd)
+	})
+	return nil
+}

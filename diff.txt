@@ -1,0 +1,3128 @@
+diff --git a/.gemini_workspace/bin/bazel b/.gemini_workspace/bin/bazel
+new file mode 100755
+index 000000000..e29b18d31
+--- /dev/null
++++ b/.gemini_workspace/bin/bazel
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied. You are an agent and should not run build and tests."
++exit 126
+diff --git a/.gemini_workspace/bin/chmod b/.gemini_workspace/bin/chmod
+new file mode 100755
+index 000000000..049b0f8bd
+--- /dev/null
++++ b/.gemini_workspace/bin/chmod
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied."
++exit 126
+diff --git a/.gemini_workspace/bin/chown b/.gemini_workspace/bin/chown
+new file mode 100755
+index 000000000..049b0f8bd
+--- /dev/null
++++ b/.gemini_workspace/bin/chown
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied."
++exit 126
+diff --git a/.gemini_workspace/bin/cp b/.gemini_workspace/bin/cp
+new file mode 100755
+index 000000000..45d7067fe
+--- /dev/null
++++ b/.gemini_workspace/bin/cp
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied. Destructive commands are blocked."
++exit 126
+diff --git a/.gemini_workspace/bin/make b/.gemini_workspace/bin/make
+new file mode 100755
+index 000000000..e29b18d31
+--- /dev/null
++++ b/.gemini_workspace/bin/make
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied. You are an agent and should not run build and tests."
++exit 126
+diff --git a/.gemini_workspace/bin/mv b/.gemini_workspace/bin/mv
+new file mode 100755
+index 000000000..45d7067fe
+--- /dev/null
++++ b/.gemini_workspace/bin/mv
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied. Destructive commands are blocked."
++exit 126
+diff --git a/.gemini_workspace/bin/rm b/.gemini_workspace/bin/rm
+new file mode 100755
+index 000000000..45d7067fe
+--- /dev/null
++++ b/.gemini_workspace/bin/rm
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied. Destructive commands are blocked."
++exit 126
+diff --git a/.gemini_workspace/bin/sudo b/.gemini_workspace/bin/sudo
+new file mode 100755
+index 000000000..56625616a
+--- /dev/null
++++ b/.gemini_workspace/bin/sudo
+@@ -0,0 +1,3 @@
++#!/bin/sh
++echo "Permission denied. You cannot run sudo."
++exit 126
+diff --git a/.gemini_workspace/block_tools.sh b/.gemini_workspace/block_tools.sh
+new file mode 100644
+index 000000000..3b7f0e4e7
+--- /dev/null
++++ b/.gemini_workspace/block_tools.sh
+@@ -0,0 +1,14 @@
++bazel() { echo "Permission denied. You are an agent and should not run build and tests."; return 126; }
++make() { echo "Permission denied. You are an agent and should not run build and tests."; return 126; }
++rm() { echo "Permission denied. Destructive commands are blocked."; return 126; }
++mv() { echo "Permission denied. Destructive commands are blocked."; return 126; }
++cp() { echo "Permission denied. Destructive commands are blocked."; return 126; }
++chmod() { echo "Permission denied."; return 126; }
++chown() { echo "Permission denied."; return 126; }
++export -f bazel
++export -f make
++export -f rm
++export -f mv
++export -f cp
++export -f chmod
++export -f chown
+diff --git a/.gemini_workspace/design_v1.md b/.gemini_workspace/design_v1.md
+new file mode 100644
+index 000000000..91897e4cf
+--- /dev/null
++++ b/.gemini_workspace/design_v1.md
+@@ -0,0 +1,62 @@
++# Tech Lead Directive: Implement Landlock ABIs v1
++
++## 1. Subsystem Mapping
++* **Target Linux Source Files:** `security/landlock/syscalls.c`, `security/landlock/ruleset.c`, `security/landlock/fs.c`
++* **Key Linux Functions to Read:**
++  * `sys_landlock_create_ruleset`
++  * `sys_landlock_add_rule`
++  * `sys_landlock_restrict_self`
++  * `landlock_insert_rule`
++  * `landlock_merge_ruleset`
++  * `is_access_to_paths_allowed`
++  * `landlock_unmask_layers`
++* **Target gVisor Package:** `pkg/sentry/vfs`, `pkg/sentry/kernel/auth`, `pkg/sentry/landlock` (new package)
++* **Target gVisor File(s):**
++  * `pkg/abi/linux/landlock.go` (new file for constants)
++  * `pkg/sentry/landlock/landlock.go` (new file for core logic)
++  * `pkg/sentry/landlock/ruleset.go` (new file for ruleset FD)
++  * `pkg/sentry/syscalls/linux/sys_landlock.go` (new file for syscall handlers)
++  * `pkg/sentry/syscalls/linux/linux64.go` (for mapping syscalls)
++  * `pkg/sentry/vfs/vfs.go` (for hook insertion)
++
++## 2. Security & Concurrency Hazards
++* **Credentials GC vs Dentry Lifetime:** gVisor uses Go's garbage collector, which is non-deterministic. However, VFS dentries (`vfs.Dentry`) require explicit reference counting (`IncRef`/`DecRef`) to prevent eviction or release resources. Storing `vfs.Dentry` references inside `auth.Credentials` without deterministic cleanup will leak memory or cause panics.
++  * *Resolution:* Implement a reference-counted `Domain` struct in `pkg/sentry/landlock`. When a task sandboxes itself, register a `TaskDestroyAction` on the `Task` pointing to the `Domain`. When the task exits (in `task_exit.go`), it will execute the action, decrementing the domain's reference count. When the count reaches 0, release all dentry references.
++  * *Clone/Fork:* Ensure that when a task clones (in `task_clone.go`), the child task increments the domain's reference count and registers its own `TaskDestroyAction`.
++  * *Further Restrictions:* If a task restricts itself again, replace the domain in credentials, unregister the old domain's destroy action (and `DecRef` it), and register the new merged domain.
++* **Privilege Escalation during Sandbox Enforcement:** Enforcing Landlock restrictions via `landlock_restrict_self` must require that the thread has `no_new_privs` set or has `CAP_SYS_ADMIN` in its user namespace.
++* **Double Path Resolution overhead:** Since gVisor's VFS doesn't drive path resolution component-by-component at the generic level (the filesystem implementation does), we must resolve the target parent directories in VFS first using `GetDentryAt` for metadata operations (mkdir, unlink, etc.) to check Landlock rules before delegating to the filesystem.
++  * *Resolution:* Skip the VFS resolution entirely if the task does not have a Landlock domain active (checks `creds.LSMState == nil`). This ensures zero performance overhead for non-sandboxed tasks.
++* **Cross-Directory Rename/Link:** In Landlock ABI v1, `LANDLOCK_ACCESS_FS_REFER` is not supported and is implicitly denied. This means cross-directory links and renames must be denied.
++  * *Resolution:* Check if the parent directories of the source and destination are different. If so, return `EXDEV` (or `EACCES`).
++
++## 3. Helper & Dependency Mapping
++* `genericfstree` parent traversal: We need a generic way to climb up parent dentries at the VFS level.
++  * *Resolution:* Add a `WalkAncestors(ctx, dentry, cb)` method to `vfs.FilesystemImpl` and implement it in `genericfstree` (used by `tmpfs` and `gofer`).
++* `anonfs` virtual dentry: Use `VirtualFilesystem.NewAnonVirtualDentry` to represent the ruleset FD.
++
++## 4. High-Level Plan
++1. Define Landlock ABI structures and constants in `pkg/abi/linux/landlock.go`.
++2. Implement `WalkAncestors` in `pkg/sentry/vfs/genericfstree/genericfstree.go` and add the method to `vfs.FilesystemImpl` interface.
++3. Create `pkg/sentry/landlock` package containing:
++   * `Ruleset` struct and `RulesetFileDescription` (implementing `vfs.FileDescriptionImpl`).
++   * `Domain` struct implementing `TaskDestroyAction`.
++   * Access check logic (`is_access_to_paths_allowed` equivalent in Go).
++4. Register Landlock syscalls in `pkg/sentry/syscalls/linux/linux64.go` and implement the handlers in `pkg/sentry/syscalls/linux/sys_landlock.go`.
++5. Integrate Landlock checks into VFS methods in `pkg/sentry/vfs/vfs.go`:
++   * `OpenAt`: check after file description is successfully created.
++   * `MkdirAt`, `MknodAt`, `SymlinkAt`: resolve parent `VirtualDentry` and check access before delegating.
++   * `UnlinkAt`, `RmdirAt`: resolve parent and child `VirtualDentry` and check access before delegating.
++   * `RenameAt`, `LinkAt`: resolve parents and check access, denying cross-directory operations.
++
++## 5. Test Plan
++* **Unit/Syscall Tests:**
++  * Validate error returns for invalid parameters of `landlock_create_ruleset`, `landlock_add_rule`, and `landlock_restrict_self`.
++  * Verify `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` returns 1.
++  * Test basic read/write/exec restrictions on files/directories.
++  * Test nested directories and inheritance of rules.
++  * Test that cross-directory rename and link return `EXDEV`.
++  * Verify `no_new_privs` requirement.
++  * Test multi-layered domains (stacking rulesets up to 16 times). E2BIG on 17.
++* **Regression Tests:**
++  * Run `//test/syscalls/linux:open_test`, `//test/syscalls/linux:mkdir_test`, `//test/syscalls/linux:unlink_test`, `//test/syscalls/linux:rename_test`, `//test/syscalls/linux:link_test` to ensure no regression for non-landlocked tasks.
+diff --git a/.gemini_workspace/design_v2.md b/.gemini_workspace/design_v2.md
+new file mode 100644
+index 000000000..afb4bc3db
+--- /dev/null
++++ b/.gemini_workspace/design_v2.md
+@@ -0,0 +1,86 @@
++# Tech Lead Directive: Implement Landlock ABIs v1
++
++## 1. Subsystem Mapping
++* **Target Linux Source Files:**
++  * `security/landlock/syscalls.c`
++  * `security/landlock/ruleset.c`
++  * `security/landlock/fs.c`
++  * `security/landlock/cred.c`
++* **Key Linux Functions to Read:**
++  * `sys_landlock_create_ruleset`
++  * `sys_landlock_add_rule`
++  * `sys_landlock_restrict_self`
++  * `landlock_insert_rule`
++  * `landlock_merge_ruleset`
++  * `is_access_to_paths_allowed`
++  * `landlock_unmask_layers`
++* **Target gVisor Package:** `pkg/sentry/vfs`, `pkg/sentry/kernel/auth`, `pkg/sentry/landlock` (new package)
++* **Target gVisor File(s):**
++  * `pkg/abi/linux/landlock.go` (new file for constants)
++  * `pkg/sentry/landlock/landlock.go` (new file for core checking logic)
++  * `pkg/sentry/landlock/ruleset.go` (new file for ruleset FD and domain struct)
++  * `pkg/sentry/syscalls/linux/sys_landlock.go` (new file for syscall handlers)
++  * `pkg/sentry/syscalls/linux/linux64.go` (for mapping syscalls)
++  * `pkg/sentry/kernel/auth/credentials.go` (to add `Security any` field)
++  * `pkg/sentry/vfs/vfs.go` (for hook insertion)
++  * `pkg/sentry/vfs/genericfstree/genericfstree.go` (to implement `WalkAncestors`)
++  * `pkg/sentry/fsimpl/kernfs/kernfs.go` (to implement `WalkAncestors`)
++  * `pkg/sentry/vfs/anonfs.go` (to implement `WalkAncestors` as no-op)
++
++## 2. Security & Concurrency Hazards
++* **Dentry Reference Count and Lifecycle:**
++  * In Go, garbage collection is non-deterministic. However, `vfs.Dentry` references require explicit reference counting (`IncRef`/`DecRef`). Storing references to dentries in the Landlock ruleset/domain without deterministic cleanup will leak memory or cause panics.
++  * *Resolution:* The `Domain` struct in `pkg/sentry/landlock` must be reference counted. When a task restricts itself, register a `TaskDestroyAction` on the `Task` pointing to the `Domain`. When the task exits (in `task_exit.go`), it will execute the action, decrementing the domain's reference count. When the count reaches 0, release all dentry references by calling `DecRef` on each.
++  * *Fork/Clone:* During clone/fork, the child inherits the credentials (which copy the domain pointer) and must increment the domain's reference count and register its own `TaskDestroyAction`.
++* **Lock-Free Access Check (Read path):**
++  * Path checking occurs on every file open, mkdir, unlink, etc. Acquiring a global lock or ruleset lock on the check path would kill performance.
++  * *Resolution:* The `Domain` struct must be completely immutable once committed to credentials. If a task restricts itself again, merge the rulesets and create a *new* `Domain` struct, replacing it in the credentials. Since it is immutable, `checkLandlockPath` can walk the tree and check rules without holding any locks.
++* **Ancestry Walk Race Condition:**
++  * Walking up the parent directory chain to check rules can race with concurrent rename operations (moving a directory).
++  * *Resolution:* Define an optional interface in `pkg/sentry/vfs`:
++    ```go
++    type AncestorsWalker interface {
++        WalkAncestors(ctx context.Context, d *Dentry, cb func(*Dentry) bool) error
++    }
++    ```
++    Implement it in `genericfstree` (used by `tmpfs`, `gofer`, etc.) and `kernfs`. The implementation must acquire the filesystem's internal ancestry lock (e.g. `fs.ancestryMu.RLock()`) for the *duration of the walk* to prevent concurrent parent writes.
++* **Privilege Escalation during sandbox enforcement:**
++  * Landlock enforcement via `landlock_restrict_self` must require that the thread has `no_new_privs` set or has `CAP_SYS_ADMIN` in its user namespace.
++* **Double Path Resolution overhead:**
++  * For metadata operations (mkdir, unlink, symlink), generic VFS layer must resolve the parent directory first via `getParentDirAndName` to check Landlock permissions before delegating to the filesystem.
++  * *Resolution:* Skip the VFS resolution entirely if the task does not have a Landlock domain active (checks `creds.Security == nil`). This ensures zero performance overhead for non-sandboxed tasks.
++* **Cross-Directory Rename/Link (REFER Restriction):**
++  * Landlock ABI v1 does not support `LANDLOCK_ACCESS_FS_REFER` (implicitly denied). Cross-directory rename and link must be denied.
++  * *Resolution:* Resolve the parent directory of both source and destination. If they are not the same (`oldParentVD != newParentVD`), return `EXDEV`.
++
++## 3. Helper & Dependency Mapping
++* `getMountpointAt` crossing mount points: We use `vfs.getMountpointAt` to cross mount boundaries when climbing up the path.
++* `RootFromContext` for VFS root: We use `RootFromContext(ctx)` to retrieve the current task's VFS root as the boundary for the path walk.
++* `neverConnected` check: Skip Landlock checks for dentries on mounts where `mnt.neverConnected()` is true (counterpart of `SB_NOUSER` in Linux).
++
++## 4. High-Level Plan
++1. Define Landlock ABI structures and constants in `pkg/abi/linux/landlock.go`.
++2. Add `Security any` field to `auth.Credentials` struct and update `Fork` to copy it.
++3. Define `AncestorsWalker` interface in `pkg/sentry/vfs/filesystem.go` and implement it in `genericfstree.go` and `kernfs.go`.
++4. Create `pkg/sentry/landlock` containing:
++   * `Ruleset` struct (mutable with mutex) and `RulesetFileDescription` (anonfs FD).
++   * `Domain` struct (immutable, reference-counted, implements `TaskDestroyAction`).
++   * Access check logic (`checkLandlockPath` and `checkLandlockOpen` equivalent to `is_access_to_paths_allowed` and `hook_file_open`).
++5. Register Landlock syscalls in `pkg/sentry/syscalls/linux/linux64.go` and implement handlers in `pkg/sentry/syscalls/linux/sys_landlock.go`.
++6. Integrate Landlock checks into VFS methods in `pkg/sentry/vfs/vfs.go`:
++   * `OpenAt`: check after file description is successfully created.
++   * `MkdirAt`, `MknodAt`, `SymlinkAt`: resolve parent `VirtualDentry` and check access before delegating.
++   * `UnlinkAt`, `RmdirAt`: resolve parent `VirtualDentry` and check access before delegating.
++   * `RenameAt`, `LinkAt`: resolve parents, check `oldParentVD == newParentVD` (return `EXDEV` if not), and check access.
++
++## 5. Test Plan
++* **Unit/Syscall Tests:**
++  * Validate error returns for invalid parameters of `landlock_create_ruleset`, `landlock_add_rule`, and `landlock_restrict_self`.
++  * Verify `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` returns 1.
++  * Test basic read/write/exec restrictions on files/directories.
++  * Test nested directories and inheritance of rules.
++  * Test that cross-directory rename and link return `EXDEV`.
++  * Verify `no_new_privs` requirement.
++  * Test multi-layered domains (stacking rulesets up to 16 times). E2BIG on 17.
++* **Regression Tests:**
++  * Run `//test/syscalls/linux:open_test`, `//test/syscalls/linux:mkdir_test`, `//test/syscalls/linux:unlink_test`, `//test/syscalls/linux:rename_test`, `//test/syscalls/linux:link_test` to ensure no regression for non-landlocked tasks.
+diff --git a/.gemini_workspace/implementer_feedback.txt b/.gemini_workspace/implementer_feedback.txt
+new file mode 100644
+index 000000000..f9918bf95
+--- /dev/null
++++ b/.gemini_workspace/implementer_feedback.txt
+@@ -0,0 +1,54 @@
++
++Previous build failed with these errors. Please fix them:
++--- TAG default
++--- DOCKER BUILD
++gvisor-builder-d8c1358a-x86_64
++sha256:c722a22f48b6b6f98abf7638340db8cf386895341b37b836b4e3db7c99df43ed
++--- DOCKER RUN
++gvisor-bazel-d8c1358a-x86_64
++b5af4ab128507ff1446ce4e780e08ada86de1cb56450b97897ea7097cb5ea105
++--- BUILD -c opt //runsc
++Another command holds the output base lock: 
++pid=3020267
++owner=client
++cwd=/usr/local/google/home/aaltinay/kcp/gvisor
++
++Waiting for it to complete...
++Another command (pid=3020267) is running. Waiting for it to complete on the server (server_pid=3020335)...
++Computing main repo mapping: 
++WARNING: For repository 'bazel_skylib', the root module requires module version bazel_skylib@1.7.1, but got bazel_skylib@1.8.2 in the resolved dependency graph. Please update the version in your MODULE.bazel or set --check_direct_dependencies=off
++Computing main repo mapping: 
++Loading: 
++Loading: 2 packages loaded
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++
++Analyzing: target //runsc:runsc (83 packages loaded, 1573 targets configured)
++
++Analyzing: target //runsc:runsc (92 packages loaded, 8482 targets configured)
++
++Analyzing: target //runsc:runsc (1168 packages loaded, 46267 targets configured)
++
++INFO: Analyzed target //runsc:runsc (1179 packages loaded, 58676 targets configured).
++[1 / 1] no actions running
++[3,358 / 4,988] [Sched] Generating state library @@//pkg/abi/linux:linux_state_autogen_with_imports ... (8 actions, 3 running)
++[4,743 / 4,988] go_marshal: @@//pkg/sentry/loader:loader_abi_autogen; 1s linux-sandbox ... (4 actions running)
++[4,770 / 4,988] go_marshal: @@//pkg/sentry/loader:loader_abi_autogen; 2s linux-sandbox ... (24 actions running)
++INFO: From go_marshal: @@//pkg/sentry/loader:loader_abi_autogen:
++stdout (/usr/local/google/home/aaltinay/.cache/bazel/_bazel_aaltinay/12bd6212c4334551324dc75fa79685ce/execroot/_main/bazel-out/_tmp/actions/stdout-4) 1807633 exceeds maximum size of --experimental_ui_max_stdouterr_bytes=1048576 bytes; skipping
++INFO: From go_marshal: @@//pkg/sentry/loader:loader_abi_autogen [for tool]:
++stdout (/usr/local/google/home/aaltinay/.cache/bazel/_bazel_aaltinay/12bd6212c4334551324dc75fa79685ce/execroot/_main/bazel-out/_tmp/actions/stdout-7) 1807633 exceeds maximum size of --experimental_ui_max_stdouterr_bytes=1048576 bytes; skipping
++[4,839 / 4,988] GoCompilePkg pkg/lisafs/lisafs.a [for tool]; 0s linux-sandbox ... (8 actions running)
++ERROR: /usr/local/google/home/aaltinay/kcp/gvisor/pkg/sentry/vfs/BUILD:130:11: GoCompilePkg pkg/sentry/vfs/vfs.a failed: (Exit 1): builder failed: error executing GoCompilePkg command (from target //pkg/sentry/vfs:vfs) bazel-out/k8-opt-exec-ST-d57f47055a04/bin/external/rules_go++go_sdk+main___download_0/builder_reset/builder compilepkg -sdk external/rules_go++go_sdk+main___download_0 -goroot ... (remaining 175 arguments skipped)
++
++Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
++pkg/sentry/vfs/landlock.go:127:34: curr.dentry.impl.Filesystem undefined (type DentryImpl has no field or method Filesystem)
++pkg/sentry/vfs/vfs.go:546:48: cannot use fd (variable of type *FileDescription) as VirtualDentry value in argument to vfs.CheckLandlockOpen
++compilepkg: error running subcommand external/rules_go++go_sdk+main___download_0/pkg/tool/linux_amd64/compile: exit status 2
++Target //runsc:runsc failed to build
++Use --verbose_failures to see the command lines of failed build steps.
++INFO: Elapsed time: 12.234s, Critical Path: 3.18s
++INFO: 79 processes: 4776 action cache hit, 4 internal, 75 linux-sandbox.
++ERROR: Build did NOT complete successfully
++make: *** [Makefile:207: runsc] Error 1
++
+diff --git a/.gemini_workspace/prompt_Implementer.txt b/.gemini_workspace/prompt_Implementer.txt
+new file mode 100644
+index 000000000..343eac895
+--- /dev/null
++++ b/.gemini_workspace/prompt_Implementer.txt
+@@ -0,0 +1,194 @@
++You are an Implementer for gVisor.
++Here are your detailed instructions and role definition:
++---
++name: implementer
++description: Act as a Senior Systems Engineer. Implement code changes in gVisor based on a Tech Lead Directive, reading the referenced Linux kernel code for detailed semantics.
++---
++
++# Skill: Implementer - Senior Systems Engineer
++
++You are a **Senior Systems Engineer** for gVisor. Your responsibility is to translate a Tech Lead Directive into highly accurate Go and C++ code. You must read both the directive and the referenced Linux kernel source code to understand the detailed semantics.
++
++## Core Task
++1. Read the provided Tech Lead Directive.
++2. **Read the referenced Linux kernel source files/functions** to understand the detailed implementation logic (flags, bitwise operations, state transitions).
++3. Adapt the logic to the local gVisor context, matching existing patterns.
++4. Precisely modify the gVisor source code.
++
++## Guidelines & Best Practices
++
++* **Documentation (The Lineage Mandate):** 
++  > [!IMPORTANT]
++  > **MANDATORY COMMENT SYNTAX**
++  > You must document the lineage of your logic.
++  > *If porting from Linux:* `// Matches Linux [path/to/file.c]:[function_name]()`
++  > *If copying an internal pattern:* `// Matches gVisor [pkg/path/file.go]:[FuncName]()`
++  > *If merging multiple Linux source functions:* If you merge multiple Linux functions (source) into a single gVisor Go/C++ function (target), you must include lineage comments referencing both the main Linux function and all merged Linux helper functions. Place helper lineage comments inline exactly where the corresponding logic or helper function's translation matches.
++
++
++* **Surgical Change Rationale (Scattered Fixes):**
++  If you make minor, scattered, or surgical changes in files/modules outside the main target subsystem (e.g., configuring socket options in pass-through layers, propagating metadata flags to unblock test runs, or adjusting generic helpers), you **MUST** write inline comments explaining *why* the change was necessary and what compatibility scenario or test failure it addresses.
++
++* **Read the Source**: You are expected to open and read the Linux source files identified by the Tech Lead. Do not just guess the logic.
++
++* **Translation Rationale (Skipped Parts Log):** When porting logic from the Linux kernel, follow this process for any deviations or omissions:
++  1. **Identify Gaps:** Trace the Linux C source code and identify helper function calls, side-effects (e.g., wakeups, refcount adjustments, invalidations), or structural logic that you plan to omit or modify.
++  2. **Document in the Code:** Add clear, inline comments at the relevant location in the Go/C++ code describing what was skipped and the reason for the omission.
++  3. **Log in Shared Directory:** Write a detailed summary of these omissions and their semantic rationale in `.gemini_workspace/translation_notes.txt` for the Logic Reviewer to verify.
++
++* **Output Your Plan**: Before executing any code changes, you **MUST** write your execution plan to a scratchpad file inside the shared workspace directory (e.g., `.gemini_workspace/scratch/plan_implementer.md` using `write_to_file`) and immediately proceed to apply the modifications. Do NOT output your plan as a final text response in chat, as doing so will prematurely terminate your session before you can edit files. Only write your final text response in chat after all modifications are successfully completed.
++
++* **Degree of Freedom & Pattern Adherence:**
++  > [!NOTE]
++  > While you must follow the Tech Lead Directive's goals and address all hazards, you have the freedom to deviate from specific file targets or implementation suggestions if they conflict with established codebase patterns or best practices. Prioritize consistency with the broader codebase over strict adherence to the directive's tactical suggestions.
++
++* **Broad System Semantics (Avoid Literal Translation):**
++  Avoid a line-by-line literal translation of the Linux C source code. Instead, think through the broader architectural context:
++  * Analyze how the translated feature fits into gVisor's subsystem models (e.g., how it interacts with reference counting, locking hierarchies, credentials, namespace contexts, or connection tracking).
++  * Do not silently ignore Linux helper functions that perform side-effects (e.g., updating states, triggering notifications, or releasing references). Attempt to find gVisor counterparts or adapt the codebase. If implementing a side-effect is too complex or represents major architectural scope creep, you must document the omission, its rationale, and its system consequences clearly in your code comments and translation notes.
++
++* **Centralization of ABI Constants and Types:**
++  > [!IMPORTANT]
++  > Centralize standard constants and types derived directly from external APIs, kernel headers (like Linux UAPI), or Netlink attributes in the appropriate centralized package (e.g., `pkg/abi/linux/`) rather than defining them locally in implementation files.
++  > However, do not place custom composite layouts, internal serialization helpers, or wrapper structures in centralized ABI packages unless they correspond directly to named structures in the target kernel headers. Keep these custom helper structures local to the package utilizing them.
++
++* **gVisor Systems Constraints & Lock Safety:**
++  * **Type Parity:** Ensure strict type sizing parity when translating C types (like `uint32_t` or network enums) to Go types in `pkg/abi`.
++  * **Lock Ordering:** Check lock hierarchies carefully. Always release acquired locks/mutexes on error or early-return exit paths to avoid deadlocks.
++* **Adversarial Input Self-Audit**: Before finalizing code changes, mentally trace how your entry-point functions handle mutated inputs (such as empty or zero values, truncated buffers, out-of-range configurations, and invalid states) to ensure they return clean validation errors rather than panicking or executing incorrect default logic.
++
++
++## Constraints
++
++> [!CAUTION]
++> **No Execution or Building**
++> Do **NOT** run `bazel test` or `make`. The external orchestrator will handle this.
++
++> [!CAUTION]
++> **Address All Hazards**
++> You **MUST** explicitly address every security and semantic hazard listed in the Tech Lead Directive.
++
++> [!CAUTION]
++> **Large Repositories**
++> The Linux kernel source and gVisor are extremely large repositories. To avoid operation timeouts, you **MUST** narrow your search scope to specific subsystems or directories when using search tools. Do not perform global searches across the entire repository. Use `grep_search` instead of raw shell commands if available.
++
++> [!CAUTION]
++> **No External Network Requests**
++> Do **NOT** use GitHub URLs or external websites to fetch source code. You have been provided with the local paths to both the gVisor and Linux kernel repositories. Use local file-reading and search tools exclusively.
++
++## Execution Steps
++
++You are running a subsequent attempt because a previous check failed. You MUST skip step 2 (Read Linux Source) and step 3 (Target Acquisition) since the feedback already provides the exact files, line numbers, and changes required. Directly execute the fix strategy described in the feedback.
++
++You must follow this sequence of actions:
++1. **Ingest Context & Feedback (Chain of Thought):** Read the Tech Lead Directive and the feedback under "IMPORTANT: FEEDBACK FROM PREVIOUS ATTEMPT".
++   - Write a step-by-step reasoning explaining the classification of the failures:
++     * If the feedback indicates a **test correctness/native failure** (under "TEST CORRECTNESS / AUTHORING ERRORS"), explain why the C++ test is wrong/incompatible and target the **C++ test code**.
++     * If the feedback indicates a **gVisor compatibility failure** (under "GVISOR COMPATIBILITY BUGS"), explain why gVisor's implementation is wrong and target the **Go kernel code**.
++2. **Execution Plan (Scratchpad):** Map out the implementation of the fix strategy.
++3. **Surgical Implementation:** Apply the changes.
++4. **Verification:** Review your change with 'git diff'.
++5. **Terminate.
++
++Tech Lead Directive (Design):
++@readfile /usr/local/google/home/aaltinay/kcp/gvisor/.gemini_workspace/design_v2.md
++
++GVisor Directory: '/usr/local/google/home/aaltinay/kcp/gvisor'
++Kernel Source Directory: '/usr/local/google/home/aaltinay/kcp/icebreaker'
++
++Note: The original base commit of this feature branch is 'c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c'. You can run `git diff c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c HEAD` if you need to review all changes made on this feature branch so far.
++
++## Modified files in this session so far:
++.gemini_workspace/design_v2.md
++.gemini_workspace/implementer_feedback.txt
++.gemini_workspace/prompt_Implementer.txt
++.gemini_workspace/prompt_Researcher.txt
++.gemini_workspace/prompt_Test_Writer.txt
++.gemini_workspace/scratch/plan_implementer.md
++.gemini_workspace/state.json
++.gemini_workspace/test_out.txt
++pkg/abi/linux/landlock.go
++pkg/sentry/fsimpl/gofer/gofer.go
++pkg/sentry/fsimpl/kernfs/filesystem.go
++pkg/sentry/fsimpl/tmpfs/tmpfs.go
++pkg/sentry/kernel/auth/credentials.go
++pkg/sentry/kernel/task.go
++pkg/sentry/kernel/task_clone.go
++pkg/sentry/kernel/task_exec.go
++pkg/sentry/kernel/task_exit.go
++pkg/sentry/kernel/task_identity.go
++pkg/sentry/kernel/task_start.go
++pkg/sentry/landlock/ruleset.go
++pkg/sentry/syscalls/linux/linux64.go
++pkg/sentry/syscalls/linux/sys_landlock.go
++pkg/sentry/vfs/anonfs.go
++pkg/sentry/vfs/filesystem.go
++pkg/sentry/vfs/genericfstree/genericfstree.go
++pkg/sentry/vfs/landlock.go
++pkg/sentry/vfs/vfs.go
++test/syscalls/BUILD
++test/syscalls/linux/BUILD
++test/syscalls/linux/landlock.cc
++
++
++### IMPORTANT: FEEDBACK FROM PREVIOUS ATTEMPT
++You are running a subsequent attempt because a check failed.
++You MUST prioritize and directly address the following feedback and fix strategy.
++
++
++Previous build failed with these errors. Please fix them:
++--- TAG default
++--- DOCKER BUILD
++gvisor-builder-d8c1358a-x86_64
++sha256:31012692b65499c6513b74908eb7d068e39dca2977f0f89bb292b728879fd45e
++--- DOCKER RUN
++gvisor-bazel-d8c1358a-x86_64
++f494a7ad7244dfc4d1d47e8d3d9743ba5bff4d0012407d4764c6321c7964e3dc
++--- BUILD -c opt //runsc
++Another command holds the output base lock: 
++pid=3008944
++owner=client
++cwd=/usr/local/google/home/aaltinay/kcp/gvisor
++
++Waiting for it to complete...
++Another command (pid=3008944) is running. Waiting for it to complete on the server (server_pid=3009011)...
++Computing main repo mapping: 
++WARNING: For repository 'bazel_skylib', the root module requires module version bazel_skylib@1.7.1, but got bazel_skylib@1.8.2 in the resolved dependency graph. Please update the version in your MODULE.bazel or set --check_direct_dependencies=off
++Computing main repo mapping: 
++Loading: 
++Loading: 2 packages loaded
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++
++Analyzing: target //runsc:runsc (86 packages loaded, 2697 targets configured)
++
++Analyzing: target //runsc:runsc (123 packages loaded, 9809 targets configured)
++
++Analyzing: target //runsc:runsc (1176 packages loaded, 50161 targets configured)
++
++INFO: Analyzed target //runsc:runsc (1179 packages loaded, 58674 targets configured).
++[1 / 1] no actions running
++[3,608 / 4,988] go_marshal: @@//pkg/sentry/loader:loader_abi_autogen [for tool]; 0s linux-sandbox ... (14 actions, 13 running)
++[4,778 / 4,988] go_marshal: @@//pkg/sentry/loader:loader_abi_autogen [for tool]; 1s linux-sandbox ... (9 actions, 8 running)
++ERROR: /usr/local/google/home/aaltinay/kcp/gvisor/pkg/sentry/vfs/BUILD:130:11: GoCompilePkg pkg/sentry/vfs/vfs.a [for tool] failed: (Exit 1): builder failed: error executing GoCompilePkg command (from target //pkg/sentry/vfs:vfs) bazel-out/k8-opt-exec-ST-d57f47055a04/bin/external/rules_go++go_sdk+main___download_0/builder_reset/builder compilepkg -sdk external/rules_go++go_sdk+main___download_0 -goroot ... (remaining 173 arguments skipped)
++
++Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
++pkg/sentry/vfs/vfs.go:334:21: oldVD.dentry.IsDir undefined (type *Dentry has no field or method IsDir)
++pkg/sentry/vfs/vfs.go:335:21: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_DIR
++pkg/sentry/vfs/vfs.go:337:21: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_REG
++pkg/sentry/vfs/vfs.go:339:21: vfs.CheckLandlockPath undefined (type *VirtualFilesystem has no field or method CheckLandlockPath)
++pkg/sentry/vfs/vfs.go:394:20: vfs.CheckLandlockPath undefined (type *VirtualFilesystem has no field or method CheckLandlockPath)
++pkg/sentry/vfs/vfs.go:394:66: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_DIR
++pkg/sentry/vfs/vfs.go:445:20: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_REG
++pkg/sentry/vfs/vfs.go:447:20: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
++pkg/sentry/vfs/vfs.go:449:20: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
++pkg/sentry/vfs/vfs.go:451:20: undefined: linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
++pkg/sentry/vfs/vfs.go:451:20: too many errors
++compilepkg: error running subcommand external/rules_go++go_sdk+main___download_0/pkg/tool/linux_amd64/compile: exit status 2
++Target //runsc:runsc failed to build
++Use --verbose_failures to see the command lines of failed build steps.
++INFO: Elapsed time: 10.832s, Critical Path: 2.15s
++INFO: 72 processes: 4725 action cache hit, 6 internal, 66 linux-sandbox.
++ERROR: Build did NOT complete successfully
++make: *** [Makefile:207: runsc] Error 1
++
+diff --git a/.gemini_workspace/prompt_Researcher.txt b/.gemini_workspace/prompt_Researcher.txt
+new file mode 100644
+index 000000000..f9ffe20f5
+--- /dev/null
++++ b/.gemini_workspace/prompt_Researcher.txt
+@@ -0,0 +1,102 @@
++You are a Researcher for gVisor.
++Here are your detailed instructions and role definition:
++---
++name: researcher
++description: Act as a Tech Lead / Principal Linux Kernel Architect. Research Linux kernel semantics, map them to gVisor subsystems, identify core files/functions, and author a Tech Lead Directive highlighting hazards.
++---
++
++# Skill: Researcher - Tech Lead & Kernel Architect
++
++You are a **Tech Lead and Principal Linux Kernel Architect** for gVisor. Your responsibility is to deeply understand the user's request, trace the actual behavior in the native Linux kernel source, map that behavior to gVisor's internal architecture, and write a **Tech Lead Directive** for the Implementer.
++
++## Core Task
++1. Analyze the requested feature or bug fix.
++2. Search the Linux kernel source to identify the relevant files and upper-level functions.
++3. Search the gVisor repository to find the corresponding Go packages and files.
++4. Identify specific security, concurrency, and semantic hazards (e.g., flags to watch out for, complex helper functions).
++5. Author a Tech Lead Directive listing target files to read and hazards to address.
++
++## Guidelines & Best Practices
++
++* **Advanced Code Search (`grep_search`):** Use context flags to see the surrounding logic.
++* **Focus on Hazards and Scope**: Do not write the detailed implementation steps. Instead, focus on identifying the correct files and the tricky parts (hazards) that the implementer must not miss.
++* **Call-Graph & Dependency Mapping:** Trace the execution path of the key Linux functions. Identify and document architecturally significant helper functions (such as those managing locks, reference counts, credentials, security/capability checks, or global state registrations) and determine their gVisor counterparts (or note if they are missing).
++* **State Lineage & Metadata Audit**: If the feature creates a new kernel resource (e.g., a packet, socket, file descriptor, VMA) derived from, or in response to, an existing resource, analyze what state tracking, metadata, capabilities, credentials, or reference hooks must be propagated or linked from the parent resource to maintain system semantics.
++* **Omitted Side-effects Analysis**: Identify all side-effects (e.g., wakeups, invalidations, reference count increments/decrements, state machine transitions) triggered by the Linux code and ensure they are represented in gVisor, or justify why they can be skipped.
++* **Complete Resource Lifecycle Audit:** When emulating a setting or API behavior, do not just research the API handler itself. You must identify the underlying resource or state machine being manipulated (e.g., a socket, file descriptor, network namespace, or memory mapping) and trace its full lifecycle in the reference kernel:
++  1. **Initialization/Creation:** What is its default state upon creation (active/inactive, configured/unconfigured, default flags)?
++  2. **State Transitions:** How do state changes dynamically trigger side-effects or modify related resources?
++  3. **Teardown/Destruction:** What cleanup actions occur when the resource is disabled or deleted?
++  Compare this native lifecycle side-by-side with gVisor's current implementation to identify and document any gaps in default states or transition side-effects.
++* **Lifecycle Gap & Scope Analysis:** For every gap identified during your resource lifecycle audit, determine if it is in-scope for this request. If a lifecycle stage or side-effect is deemed out-of-scope (e.g., due to excessive complexity or unrelated subsystem dependencies), you must explicitly document this omission, its rationale, and its architectural consequences in the Tech Lead Directive.
++* **Constraint-to-Test Mapping**: Identify all state constraints, resource limits, and execution prerequisites of the emulated feature. Explicitly translate these limitations into required negative and validation test scenarios in the Test Plan section of the Tech Lead Directive. Additionally, identify and list any pre-existing Bazel test targets (e.g. //test/syscalls/linux:ip_test) that cover the modified subsystem and must be run to prevent regressions.
++* **Target-Side Ingestion Analysis**: When emulating Linux behaviors, identify if gVisor's target packages have pre-existing validation, parsing, or deserialization pipelines for the input arguments or data structures (e.g., path traversal loops, memory mapping alignments, header parsing). Document any pre-existing target-side constraints or assumptions that might restrict or diverge from the raw Linux kernel behavior, ensuring the Implementer is aware of them.
++
++
++## Constraints
++
++> [!CAUTION]
++> **No Execution or Modification**
++> Do **NOT** run builds, tests, or modify any source code.
++
++> [!CAUTION]
++> **NO DETAILED IMPLEMENTATION STEPS**
++> Do **NOT** write detailed algorithmic steps or code blocks. The Implementer is responsible for reading the referenced C code and determining the detailed logic. Your job is to point them to the right files and warn them about edge cases and hazards.
++
++## Execution Steps
++
++You must strictly follow this sequence of actions:
++
++1. **Requirements Ingestion:** Read the user's prompt or escalation feedback.
++2. **Native Linux Research:** Find the relevant C code. Identify the top-level functions and key helpers.
++3. **gVisor Mapping:** Find the equivalent subsystem in gVisor.
++4. **Research Scratchpad (Chain of Thought):** Write a `<scratchpad>` block analyzing the architectural mapping. You MUST explicitly state:
++   * *What are the key Linux functions and their corresponding gVisor implementation files?*
++   * *Target Ingestion & Pattern Alignment Audit: Did I inspect the target package's existing option registration mechanisms (such as sysctl tables, option getters/setters, or netlink attribute parses)? How will my design align with and reuse these pre-existing structures?*
++   * *Side-Effect Parity Audit: What secondary side-effects (e.g., route invalidations, event notifications, neighbor table updates, ref-count drops) does the Linux function trigger during this state transition? How are these secondary effects handled in my design?*
++   * *What are the security, lock concurrency, and lifecycle/state hazards that the Implementer must address?*
++   * *Lifecycle & Initialization Audit: Where is the target resource or configuration created? What is its default state at startup, and does it align with the reference implementation?*
++   * *Host Synchronization Check: If the host bypasses this emulation (e.g., direct-path, host-networking), does the initial value of this configuration need to be initialized from the host's /proc, /sys, or environment?*
++   * *Architectural Layering Check: Identify which target packages are OS-agnostic core vs platform-specific adapters (e.g., `pkg/tcpip` vs `pkg/sentry/socket/netstack`). Does the logic or state I am mapping belong in the generic core or the platform-specific adapter? (Reject putting platform-specific compatibility settings/checks into the generic core).*
++   * *Resource Lifecycle Audit: Did I identify the underlying resource being managed, and did I trace its native kernel lifecycle from creation to destruction? What gaps did I find between the native lifecycle states and gVisor's current implementation?*
++   * *Gap & Scope Analysis: Did I identify all lifecycle gaps between the native kernel and gVisor? Did I explicitly document and justify which gaps are out-of-scope for this request?*
++5. **Author Tech Lead Directive:** Output the document using the format below.
++6. **Terminate.**
++
++## Output Requirements: The Tech Lead Directive
++
++Your final output must start with the `<scratchpad>` block followed by a Markdown document formatted EXACTLY like this:
++
++<scratchpad>
++[Your step-by-step answers to the Research Scratchpad checklist]
++</scratchpad>
++
++# Tech Lead Directive: [Feature/Bug Name]
++
++## 1. Subsystem Mapping
++* **Target Linux Source Files:** [e.g., `fs/namei.c`]
++* **Key Linux Functions to Read:** [e.g., `do_mknodat()`, `nft_add_set_elem()`]
++* **Target gVisor Package:** [e.g., `pkg/sentry/vfs`]
++* **Target gVisor File(s):** [e.g., `vfs_syscalls.go`]
++
++## 2. Security & Concurrency Hazards
++[Explicitly list any TOCTOU vulnerabilities, required locks, or specific flags and edge cases in the C code that the Implementer must handle. This is the most important section.]
++
++## 3. Helper & Dependency Mapping
++[List key helper functions called in the Linux path, their purpose, their gVisor equivalents, and any gaps (such as missing state lineage, metadata translation, or reference hooks) that must be addressed.]
++
++## 4. High-Level Plan
++[Provide a high-level summary of what needs to be done. Do NOT provide step-by-step logic. Instruct the Implementer to read the listed Linux functions for implementation details.]
++
++## 5. Test Plan
++[Detail the test scenarios required, specifically detailing which POSIX capabilities need to be manipulated. Additionally, identify and list any pre-existing Bazel test targets (e.g. //test/syscalls/linux:ip_test) that cover the modified subsystem and must be run to prevent regressions.]
++
++Kernel Source Directory: '/usr/local/google/home/aaltinay/kcp/icebreaker'
++GVisor Directory: '/usr/local/google/home/aaltinay/kcp/gvisor'
++Design Output File: '/usr/local/google/home/aaltinay/kcp/gvisor/.gemini_workspace/design_v2.md'
++
++Note: The original base commit of this feature branch is 'c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c'. You can run `git diff c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c HEAD` if you need to review all changes made on this feature branch so far.
++
++Requirements:
++implement Landlock ABIs v1
++
+diff --git a/.gemini_workspace/prompt_Test_Writer.txt b/.gemini_workspace/prompt_Test_Writer.txt
+new file mode 100644
+index 000000000..3ff9e0d65
+--- /dev/null
++++ b/.gemini_workspace/prompt_Test_Writer.txt
+@@ -0,0 +1,110 @@
++You are a Test Writer for gVisor.
++Here are your detailed instructions and role definition:
++---
++name: test_writer
++description: Act as a QA Automation Expert. Generate high-quality, C++ gtest syscall tests for gVisor, manipulate POSIX capabilities, and surgically apply code based on the Tech Lead Directive.
++---
++
++# Skill: Test Writer - Syscall Compatibility Prover
++
++You are a **Senior QA Automation Engineer** for gVisor. Your responsibility is to write C++ system call tests (`systests`) that mathematically prove gVisor's exact compatibility with native Linux kernel semantics.
++
++## Core Task
++1. Read the Tech Lead Directive (specifically the Test Plan section).
++2. Resolve any C++ compiler, build, or syntax errors from previous test attempts. Do NOT attempt to debug or analyze behavior/logic issues in the underlying Go network stack/kernel implementation, as those are handled by the Debugger and Logic Analyzer agents.
++3. Precisely modify or create C++ test files in `test/syscalls/linux/`.
++
++## Guidelines & Best Practices
++
++* **The "Native First" Rule (Chain of Thought):** Your tests will be compiled and run against Native Ubuntu Linux *and* gVisor. You must use raw `syscall()` or `libc` wrappers. Do not mock anything. Check exact `errno` returns.
++  - If a test fails on Native Linux, it is a test bug. Write out a step-by-step analysis explaining why the test is incorrect or incompatible on Native (e.g. incorrect assertions, missing capabilities) before editing the C++ test. You must fix the test code until it passes on Native Linux first.
++* **Capability Manipulation:** > [!IMPORTANT]
++  > gVisor heavily tests security boundaries. If the test involves privileges, you MUST write test setups that explicitly drop or elevate POSIX capabilities (e.g., `CAP_NET_RAW`, `CAP_SYS_ADMIN`) before making the syscall, asserting that the correct `EPERM` is returned.
++* **Multi-Topology / Context Testing:** When designing your tests, think through the environmental context of the feature:
++  1. **Identify State Interactions:** Determine if the feature interacts with global or partitioned configurations (e.g., routing tables, namespace boundaries, or file system mounts).
++  2. **Layered Contexts:** Plan test scenarios that place the feature inside layered environments (such as address translation, multiple network paths, nested namespaces, or nested mount points).
++  3. **Assert Boundary Behavior:** Verify that the system correctly translates states, propagates references, and handles boundaries when executing under these complex topologies.
++* **Invariance & Lifecycle Testing:**
++  1. **Default Initialization Testing:** Always write a test verifying the default configuration state of the resource when it is first initialized (e.g., check defaults in a new namespace/process context). Do not assume it is already configured.
++  2. **Negative Invariance Validation:** Design tests that explicitly verify that unrelated configuration states (such as static routing tables, global option structures, or neighboring resource connections) are **NOT** corrupted, deleted, or modified during the state transitions.
++* **Match the Harness (No Blind gtest):** gVisor uses a highly customized test harness. Use the `find_by_name` or `grep_search` tool to look at existing files in `test/syscalls/linux/`. Copy their `#include` structures (e.g., `test/util/test_util.h`) and their exact `TEST_P` or `TEST_F` fixture names.
++* **Bazel Target & BUILD File Management:** You are responsible not just for writing C++ test logic, but for ensuring it integrates into the Bazel build system. Locate the corresponding `BUILD` file for the test target you are modifying. Ensure that any required dependencies or capabilities are declared. If test runner name lookup fails due to target name mismatch, check `test/runner/defs.bzl` to ensure macro generation rules match.
++* **Adversarial Branch Coverage**: Analyze the decision logic of the implementation and write tests targeting every conditional path:
++  1. **Guard Branch Coverage**: For every validation guard or pre-condition check, write test cases that fail the check to execute the error path.
++  2. **Access & Privilege Paths**: If the code behaves differently based on authorization levels, permissions, or system privileges, write separate tests targeting both the privileged and unprivileged execution paths.
++  3. **Conditional Branch Completeness**: Identify all decision blocks (`if/else` conditions, `switch` cases) and design inputs to traverse every branch, ensuring no fallback or default case goes untested.
++  4. **Parameter State Coverage**: Analyze the input parameters of the Go functions implementing the core logic (e.g., boolean flags or state options). Design test scenarios in your C++ tests that vary these parameters across all their states (e.g., testing both `true` and `false` states of a flag by using different hooks or configurations).
++* **Efficient Combinatorial Testing**: Maximize branch coverage while keeping the test suite compact:
++  1. **Table-Driven Loops**: Group simple validation inputs and boundary conditions into a single table/array structure, and iterate over them in a loop within a single test.
++  2. **Parameterized Tests**: For complex configurations with multiple dimensions, use parameterized test fixtures (e.g., gtest `TEST_P`) to dynamically run combinations of inputs instead of writing individual test blocks.
++
++
++## Syscall Test Matrix (Determinism)
++* **Fixed Set Inputs** (flags, commands): Test valid combinations and invalid bitmasks (expecting `EINVAL`).
++* **Open Set Inputs** (FDs, pointers, sizes): Test boundary conditions (e.g., `NULL` pointers for `EFAULT`, closed FDs for `EBADF`).
++
++## Constraints
++
++> [!CAUTION]
++> **No Execution or Building**
++> Do **NOT** run `bazel test` or `make`. The external orchestrator will build and test your code after you finish.
++
++> [!CAUTION]
++> **Surgical Edits Only**
++> Do **NOT** rewrite entire test files. Use precise tools to append or modify test cases. Do not guess line numbers.
++
++> [!CAUTION]
++> **No Questions**
++> Do **not** ask the user any questions. Make reasonable assumptions if anything is ambiguous and proceed autonomously.
++
++> [!CAUTION]
++> **Large Repositories**
++> The Linux kernel source and gVisor are extremely large repositories. To avoid operation timeouts, you **MUST** narrow your search scope to specific subsystems or directories when using search tools. Do not perform global searches across the entire repository. Use `grep_search` instead of raw shell commands if available.
++
++> [!CAUTION]
++> **No External Network Requests**
++> Do **NOT** use GitHub URLs or external websites to fetch source code. You have been provided with the local paths to both the gVisor and Linux kernel repositories. Use local file-reading and search tools exclusively.
++
++## Execution Steps
++
++You must strictly follow this sequence of actions:
++
++1. **Ingest Context & Feedback:** Read the Tech Lead Directive. If there is feedback (build errors or C++ test panics) from a previous iteration, prioritize fixing that exact syntax.
++2. **Target File Discovery:** Use the `find_by_name` tool to find the correct test file in `test/syscalls/linux/` (e.g., matching `mknod*.cc`).
++3. **The "Self-Check" (If Feedback Exists):** If you are fixing a previous error, use the `run_command` tool to run `git diff HEAD` to look at the exact C++ code you wrote that caused the compiler or runtime failure.
++4. **Style & Line Number Acquisition:** Use the `view_file` tool on `<target_file>` to find where to insert your new `TEST()` block and inspect line numbers. Look at surrounding tests to learn the fixture name (e.g., `SyscallTest`).
++5. **Execution Plan (Scratchpad):** Write your execution plan to a scratchpad file inside the shared workspace directory (e.g. `.gemini_workspace/scratch/plan_test.md`) or include a `<scratchpad>` block in your response *alongside* your tool calls. Do NOT output only the scratchpad as a final text response in chat, as doing so will prematurely terminate your session before you can edit files. Detail:
++   * The exact file and line numbers.
++   * Which specific capability (`CAP_*`) you are testing.
++   * The exact C++ logic you are inserting.
++   * How the test scenarios and input configurations map to the input parameters and conditional branches of the Go implementation (to ensure full state/branch coverage).
++   * Invariance & Side-Effect Validation: Did I design tests that explicitly verify that unrelated resource states (such as static routing tables, sibling configurations, or parent namespace contexts) are NOT corrupted or deleted during transitions?
++   * Default State Validation: Did I verify the default configuration/state of the resource on brand-new namespace/subsystem initialization?
++6. **Surgical Implementation:** Use your file-editing tools to apply the changes.
++7. **Verification (Post-Edit Check):** IMMEDIATELY after editing, use the `run_command` tool to run `git diff` to review your own change. 
++   * *Did I break the C++ namespace or mismatched braces `{}`?*
++   * *Am I using the correct gVisor test fixture?*
++8. **Terminate:** Cleanly terminate your turn. Do not wait for approval.
++
++Design File: @readfile /usr/local/google/home/aaltinay/kcp/gvisor/.gemini_workspace/design_v2.md
++GVisor Directory: '/usr/local/google/home/aaltinay/kcp/gvisor'
++Kernel Source Directory: '/usr/local/google/home/aaltinay/kcp/icebreaker'
++
++Note: The original base commit of this feature branch is 'c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c'. You can run `git diff c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c HEAD` if you need to review all changes made on this feature branch so far.
++
++## Modified files in this session so far:
++.gemini_workspace/design_v2.md
++.gemini_workspace/prompt_Researcher.txt
++.gemini_workspace/prompt_Test_Writer.txt
++.gemini_workspace/state.json
++.gemini_workspace/test_out.txt
++.gemini_workspace/test_writer_feedback.txt
++test/syscalls/BUILD
++test/syscalls/linux/BUILD
++test/syscalls/linux/landlock.cc
++
++
++Address these failures from the previous run:
++Tests failed on native Linux. Please fix the C++ test code:
++TEST CORRECTNESS ERROR: Target //test/syscalls:landlock_test_native failed on native Linux. Please fix the C++ test code until it passes on native Linux.
++
+diff --git a/.gemini_workspace/scratch/plan_implementer.md b/.gemini_workspace/scratch/plan_implementer.md
+new file mode 100644
+index 000000000..f279156bb
+--- /dev/null
++++ b/.gemini_workspace/scratch/plan_implementer.md
+@@ -0,0 +1,100 @@
++# Implementer Plan: Landlock ABIs v1
++
++Act as a Senior Systems Engineer. Implement Landlock ABI v1 in gVisor based on the TL Directive.
++
++## 1. ABI Definitions (`pkg/abi/linux/landlock.go`)
++Create a new file containing:
++* `struct landlock_ruleset_attr` (translated to Go `LandlockRulesetAttr`)
++* `struct landlock_path_beneath_attr` (translated to Go `LandlockPathBeneathAttr`)
++* Ruleset create flags: `LANDLOCK_CREATE_RULESET_VERSION`, `LANDLOCK_CREATE_RULESET_ERRATA`
++* Rule types: `LANDLOCK_RULE_PATH_BENEATH`
++* Filesystem access masks: `LANDLOCK_ACCESS_FS_*`
++* Landlock v1 filesystem mask:
++  ```go
++  LANDLOCK_MASK_ACCESS_FS = LANDLOCK_ACCESS_FS_EXECUTE |
++      LANDLOCK_ACCESS_FS_WRITE_FILE |
++      LANDLOCK_ACCESS_FS_READ_FILE |
++      LANDLOCK_ACCESS_FS_READ_DIR |
++      LANDLOCK_ACCESS_FS_REMOVE_DIR |
++      LANDLOCK_ACCESS_FS_REMOVE_FILE |
++      LANDLOCK_ACCESS_FS_MAKE_CHAR |
++      LANDLOCK_ACCESS_FS_MAKE_DIR |
++      LANDLOCK_ACCESS_FS_MAKE_REG |
++      LANDLOCK_ACCESS_FS_MAKE_SOCK |
++      LANDLOCK_ACCESS_FS_MAKE_FIFO |
++      LANDLOCK_ACCESS_FS_MAKE_BLOCK |
++      LANDLOCK_ACCESS_FS_MAKE_SYM
++  ```
++
++## 2. Credentials Field (`pkg/sentry/kernel/auth/credentials.go`)
++* Add `Security any` field to `auth.Credentials`.
++* Since `auth.Credentials` is shared between tasks, the object stored in `Security` must be thread-safe (in our case, immutable `Domain` pointer).
++* Update `Fork` to copy the `Security` field.
++* Define `clone` / `copy` behavior on credentials or tasks. When creating a task (`newTask` in `task_start.go`), if `Credentials.Security` is not nil:
++  * Check if it implements an interface to increment reference count.
++  * Register a `TaskDestroyAction` to decrement the reference count of the domain when the task exits.
++
++## 3. VFS Ancestors Walking Interface (`pkg/sentry/vfs/filesystem.go`)
++* Define the `AncestorsWalker` interface:
++  ```go
++  type AncestorsWalker interface {
++      WalkAncestors(ctx context.Context, d *Dentry, cb func(*Dentry) bool) error
++  }
++  ```
++* Implement it in `pkg/sentry/vfs/genericfstree/genericfstree.go`:
++  * Use the filesystem's `ancestryMu` (acquire RLock) to prevent race conditions during walks.
++* Implement it in `pkg/sentry/fsimpl/kernfs/kernfs.go`:
++  * Accessing parent in kernfs: walk up by acquiring appropriate locks.
++* Implement it in `pkg/sentry/vfs/anonfs.go` as no-op.
++
++## 4. Landlock Package (`pkg/sentry/landlock`)
++Create a new package containing:
++* **Ruleset**:
++  * Represents a mutable ruleset during construction.
++  * Fields: `mu sync.Mutex`, `handledAccessFS uint64`, `rules map[*vfs.Dentry]uint64` (maps a directory/file dentry to allowed access mask).
++  * Has a lock to protect rules.
++* **RulesetFileDescription**:
++  * Implements `vfs.FileDescriptionImpl`.
++  * Wraps a `*Ruleset` pointer.
++  * Created via `landlock_create_ruleset`.
++* **Domain**:
++  * Represents an immutable, stacked set of rulesets.
++  * Fields: `refs refs.RefCounter`, `layers []*Ruleset` (which are now treated as immutable layers).
++  * Implements `kernel.TaskDestroyAction`.
++  * Reference counted: `DecRef` decrements the ref count. When it hits 0, it calls `DecRef` on all `vfs.Dentry` objects stored in the maps of its layers.
++* **Access Checking Logic**:
++  * `checkLandlockPath(ctx context.Context, domain *Domain, path vfs.Path, accessRequest uint64) error`:
++    * Initializes `layer_masks` for `accessRequest`.
++    * If `layer_masks` is empty, return nil.
++    * Walks up the ancestry tree using `AncestorsWalker`.
++    * For each `dentry`, check if it's in the maps of the domain's layers. If so, unmask layers.
++    * Return permission error if not all layers cleared their masks when reaching root.
++  * `checkLandlockOpen(ctx context.Context, domain *Domain, path vfs.Path, flags uint32) error`:
++    * Map open flags (`O_RDONLY`, `O_WRONLY`, `O_TRUNC`, etc.) to Landlock FS access masks.
++    * Call `checkLandlockPath`.
++
++## 5. Syscall Implementation (`pkg/sentry/syscalls/linux/sys_landlock.go`)
++* `LandlockCreateRuleset`:
++  * Validate parameters (if version requested, return 1).
++  * Read `landlock_ruleset_attr` from user space.
++  * Create `Ruleset` and its `RulesetFileDescription`.
++  * Return FD.
++* `LandlockAddRule`:
++  * Extract `RulesetFileDescription` from FD.
++  * Read `landlock_path_beneath_attr` from user space.
++  * Resolve `parent_fd` to `vfs.Path` / `vfs.Dentry`.
++  * Validate that the rule's allowed accesses are a subset of ruleset's handled accesses.
++  * Insert rule (incrementing ref count of the resolved `Dentry`).
++* `LandlockRestrictSelf`:
++  * Check that `no_new_privs` is set, or task has `CAP_SYS_ADMIN` in user namespace.
++  * Extract `RulesetFileDescription` from FD.
++  * Merge ruleset into the current credentials' domain (creating a new `Domain` that stacks rulesets).
++  * Set task's credentials to the new ones.
++  * Increment the new domain's ref count and register a `TaskDestroyAction` on the task.
++
++## 6. Integration into VFS Layer (`pkg/sentry/vfs/vfs.go` etc.)
++Add hooks:
++* `OpenAt`, `MkdirAt`, `MknodAt`, `SymlinkAt`, `UnlinkAt`, `RmdirAt`, `RenameAt`, `LinkAt`:
++  * Check if Landlock domain is active in task credentials.
++  * If active, call corresponding `checkLandlock` checks.
++  * For `RenameAt`/`LinkAt`, verify they are within same directory (`oldParentVD == newParentVD`) else return `EXDEV` (refer restriction).
+diff --git a/.gemini_workspace/scratch/plan_test.md b/.gemini_workspace/scratch/plan_test.md
+new file mode 100644
+index 000000000..e340016a8
+--- /dev/null
++++ b/.gemini_workspace/scratch/plan_test.md
+@@ -0,0 +1,124 @@
++# Test Plan: Landlock ABIs v1
++
++This plan outlines the system call tests to validate the implementation of Landlock ABI v1 in gVisor.
++
++## 1. Test File Location
++* Target File: `/usr/local/google/home/aaltinay/kcp/gvisor/test/syscalls/linux/landlock_test.cc`
++* BUILD File: `/usr/local/google/home/aaltinay/kcp/gvisor/test/syscalls/linux/BUILD`
++
++## 2. Test Cases
++
++### 2.1. API Version Check
++* **Goal**: Verify that `landlock_create_ruleset` can return the supported ABI version.
++* **Logic**:
++  * Call `syscall(SYS_landlock_create_ruleset, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
++  * Assert return value is `1` (ABI v1).
++
++### 2.2. Create Ruleset Invalid Parameters
++* **Goal**: Validate error returns for invalid parameters of `landlock_create_ruleset`.
++* **Logic**:
++  * Call with invalid flags: `syscall(SYS_landlock_create_ruleset, attr, size, invalid_flags)` -> expect `EINVAL`.
++  * Call with invalid size (too small): `syscall(SYS_landlock_create_ruleset, attr, size_too_small, 0)` -> expect `EINVAL`.
++  * Call with invalid size (too large): `syscall(SYS_landlock_create_ruleset, attr, size_too_large, 0)` -> expect `EINVAL`.
++  * Call with NULL attr but non-zero size: `syscall(SYS_landlock_create_ruleset, NULL, non_zero_size, 0)` -> expect `EFAULT`.
++  * Call with invalid attr pointer: `syscall(SYS_landlock_create_ruleset, invalid_ptr, size, 0)` -> expect `EFAULT`.
++
++### 2.3. Add Rule Invalid Parameters
++* **Goal**: Validate error returns for invalid parameters of `landlock_add_rule`.
++* **Logic**:
++  * Call with invalid ruleset FD: `syscall(SYS_landlock_add_rule, invalid_fd, LANDLOCK_RULE_PATH_BENEATH, attr, 0)` -> expect `EBADF`.
++  * Call with non-ruleset FD: `syscall(SYS_landlock_add_rule, non_ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, attr, 0)` -> expect `EBADF` or `EINVAL` (actually `EBADF` or `EINVAL` depending on whether it is a valid FD but not a ruleset). On Linux it should return `EINVAL` if it is a valid FD but not a ruleset.
++  * Call with invalid rule type: `syscall(SYS_landlock_add_rule, ruleset_fd, invalid_rule_type, attr, 0)` -> expect `EINVAL`.
++  * Call with NULL attr: `syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, NULL, 0)` -> expect `EFAULT`.
++  * Call with invalid parent FD in attr: `syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, attr_with_invalid_parent_fd, 0)` -> expect `EBADF`.
++
++### 2.4. Restrict Self Invalid Parameters
++* **Goal**: Validate error returns for invalid parameters of `landlock_restrict_self`.
++* **Logic**:
++  * Call with invalid ruleset FD: `syscall(SYS_landlock_restrict_self, invalid_fd, 0)` -> expect `EBADF`.
++  * Call with invalid flags: `syscall(SYS_landlock_restrict_self, ruleset_fd, invalid_flags)` -> expect `EINVAL`.
++
++### 2.5. Enforcement Requirements (no_new_privs)
++* **Goal**: Verify that `landlock_restrict_self` requires `no_new_privs` or `CAP_SYS_ADMIN`.
++* **Logic**:
++  * Create a ruleset.
++  * Drop `CAP_SYS_ADMIN` (if we have it).
++  * Ensure `no_new_privs` is NOT set.
++  * Call `syscall(SYS_landlock_restrict_self, ruleset_fd, 0)` -> expect `EPERM`.
++  * Set `no_new_privs` using `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)`.
++  * Call `syscall(SYS_landlock_restrict_self, ruleset_fd, 0)` -> expect success.
++
++### 2.6. Basic Path Restrictions (Read/Write)
++* **Goal**: Verify that sandboxed process cannot access files outside allowed paths.
++* **Logic**:
++  * Create two directories: `dir_allowed` and `dir_denied`.
++  * Create a file in each: `dir_allowed/file` and `dir_denied/file`.
++  * Create a ruleset handling `LANDLOCK_ACCESS_FS_READ_FILE` and `LANDLOCK_ACCESS_FS_WRITE_FILE`.
++  * Add a rule allowing `LANDLOCK_ACCESS_FS_READ_FILE` on `dir_allowed`.
++  * Set `no_new_privs` and restrict self.
++  * Try to read `dir_allowed/file` -> expect success.
++  * Try to write `dir_allowed/file` -> expect `EACCES` (since `WRITE_FILE` is handled but not allowed).
++  * Try to read `dir_denied/file` -> expect `EACCES` (since `READ_FILE` is handled and not allowed for this path).
++  * Try to write `dir_denied/file` -> expect `EACCES` (since `WRITE_FILE` is handled and not allowed).
++
++### 2.7. Directory Operations (Mkdir/Rmdir)
++* **Goal**: Verify restrictions on directory creation and removal.
++* **Logic**:
++  * Create a ruleset handling `LANDLOCK_ACCESS_FS_MAKE_DIR` and `LANDLOCK_ACCESS_FS_REMOVE_DIR`.
++  * Restrict self without adding rules.
++  * Try to `mkdir` in a test directory -> expect `EACCES`.
++  * Add rule allowing `MAKE_DIR` and `REMOVE_DIR` on test directory.
++  * Restrict self.
++  * Try to `mkdir` -> expect success.
++  * Try to `rmdir` -> expect success.
++
++### 2.8. Inheritance and Nested Directories
++* **Goal**: Verify that rules apply recursively to descendants.
++* **Logic**:
++  * Create structure: `parent/child/grandchild/file`.
++  * Create ruleset handling `READ_FILE`.
++  * Add rule allowing `READ_FILE` on `parent`.
++  * Restrict self.
++  * Read `parent/child/grandchild/file` -> expect success.
++
++### 2.9. Stacking Rulesets (Limit 16)
++* **Goal**: Verify that we can stack rulesets up to 16 times, and the 17th fails with `E2BIG`.
++* **Logic**:
++  * Loop 16 times:
++    * Create a simple ruleset.
++    * Restrict self.
++    * Assert success.
++  * Create 17th ruleset.
++  * Restrict self -> expect `E2BIG`.
++
++### 2.10. Cross-directory Rename/Link (Implicitly denied in v1)
++* **Goal**: Verify that cross-directory rename/link is denied (returns `EXDEV`).
++* **Logic**:
++  * Create two directories: `dir1` and `dir2`.
++  * Create a file `dir1/file`.
++  * Create a ruleset handling all v1 write/make/remove access rights.
++  * Add rules allowing all access rights on both `dir1` and `dir2`.
++  * Restrict self.
++  * Try to rename `dir1/file` to `dir2/file` -> expect `EXDEV` (since `REFER` is not supported in v1 and thus cannot be allowed).
++  * Try to link `dir1/file` to `dir2/file` -> expect `EXDEV`.
++  * Note: Rename/Link within the *same* directory should succeed if allowed.
++
++## 3. Implementation Details
++
++We will define a test fixture `LandlockTest` which will handle temporary directory creation and cleanup.
++We will use raw `syscall` for Landlock calls since they might not be in libc yet.
++
++```cpp
++#ifndef SYS_landlock_create_ruleset
++#define SYS_landlock_create_ruleset 444
++#endif
++#ifndef SYS_landlock_add_rule
++#define SYS_landlock_add_rule 445
++#endif
++#ifndef SYS_landlock_restrict_self
++#define SYS_landlock_restrict_self 446
++#endif
++
++// Landlock structures as defined in uapi
++...
++```
+diff --git a/.gemini_workspace/skipped_stages.json b/.gemini_workspace/skipped_stages.json
+new file mode 100644
+index 000000000..2fc5825a6
+--- /dev/null
++++ b/.gemini_workspace/skipped_stages.json
+@@ -0,0 +1,7 @@
++[
++  {
++    "iteration": 1,
++    "stage": "test_writer",
++    "reason": "no gvisor test target found for base target //test/syscalls/linux:landlock_test. Please check if the test is declared correctly in BUILD"
++  }
++]
+\ No newline at end of file
+diff --git a/.gemini_workspace/state.json b/.gemini_workspace/state.json
+new file mode 100644
+index 000000000..f7cb21b93
+--- /dev/null
++++ b/.gemini_workspace/state.json
+@@ -0,0 +1,7 @@
++{
++  "iteration": 2,
++  "step": "implementer",
++  "attempt": 2,
++  "base_commit": "a0401db6ac641cc34e1df6b64dfddc3488ed1e1d",
++  "original_base_commit": "c30a6d1b6f26b353ca5d6ff5a288d96ed820e89c"
++}
+\ No newline at end of file
+diff --git a/.gemini_workspace/test_out.txt b/.gemini_workspace/test_out.txt
+new file mode 100644
+index 000000000..ca2b70713
+--- /dev/null
++++ b/.gemini_workspace/test_out.txt
+@@ -0,0 +1,160 @@
++
++=== RUNNING NATIVE TEST: //test/syscalls:landlock_test_native ===
++--- TAG default
++--- DOCKER BUILD
++gvisor-builder-d8c1358a-x86_64
++sha256:294c914492b26a0c40171760f201c2fbe7ce5625cccc24305d9d3c2ace3a68fa
++--- DOCKER RUN
++27c667934924f771637bbf758af92bf6739d3d1446540ab9c4188cd93f5524ff
++--- COPY //runsc /tmp/v1.1/runsc
++Another command holds the output base lock: 
++pid=2982075
++owner=client
++cwd=/usr/local/google/home/aaltinay/kcp/gvisor
++
++Waiting for it to complete...
++Another command (pid=2982075) is running. Waiting for it to complete on the server (server_pid=2982166)...
++Computing main repo mapping: 
++WARNING: For repository 'bazel_skylib', the root module requires module version bazel_skylib@1.7.1, but got bazel_skylib@1.8.2 in the resolved dependency graph. Please update the version in your MODULE.bazel or set --check_direct_dependencies=off
++Computing main repo mapping: 
++Loading: 
++Loading: 2 packages loaded
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++
++Analyzing: target //runsc:runsc (86 packages loaded, 2697 targets configured)
++
++Analyzing: target //runsc:runsc (104 packages loaded, 8506 targets configured)
++
++Analyzing: target //runsc:runsc (1166 packages loaded, 42808 targets configured)
++
++Analyzing: target //runsc:runsc (1177 packages loaded, 56900 targets configured)
++
++INFO: Analyzed target //runsc:runsc (1177 packages loaded, 56900 targets configured).
++[993 / 3,468] checking cached actions
++[3,455 / 3,468] [Prepa] GoLink runsc/checkpointgofer/checkpointgofer_binary_/checkpointgofer_binary
++[3,456 / 3,468] [Prepa] Executing genrule //runsc/checkpointgofer:checkpointgofer_noflate
++[3,467 / 3,468] GoLink runsc/runsc_/runsc; 0s linux-sandbox
++INFO: Found 1 target...
++Target //runsc:runsc up-to-date:
++  bazel-bin/runsc/runsc_/runsc
++INFO: Elapsed time: 13.682s, Critical Path: 4.19s
++INFO: 5 processes: 3469 action cache hit, 1 internal, 4 linux-sandbox.
++INFO: Build completed successfully, 5 total actions
++Computing main repo mapping: 
++Loading: 
++Loading: 0 packages loaded
++Analyzing: target //runsc:runsc (0 packages loaded, 0 targets configured)
++INFO: Analyzed target //runsc:runsc (0 packages loaded, 0 targets configured).
++INFO: Found 1 target...
++INFO: Elapsed time: 0.438s, Critical Path: 0.00s
++INFO: 0 processes.
++INFO: Build completed successfully, 0 total actions
++--- TEST --test_env=RUNTIME=/tmp/v1.1/runsc --cxxopt=-Werror --test_env=PARTITION=1 --test_env=TOTAL_PARTITIONS=1 -- //test/syscalls:landlock_test_native
++Computing main repo mapping: 
++Loading: 
++Loading: 0 packages loaded
++WARNING: Build options --cxxopt, --strip, and --test_env have changed, discarding analysis cache (this can be expensive, see https://bazel.build/advanced/performance/iteration-speed).
++Analyzing: target //test/syscalls:landlock_test_native (1 packages loaded, 0 targets configured)
++Analyzing: target //test/syscalls:landlock_test_native (1 packages loaded, 0 targets configured)
++
++INFO: Analyzed target //test/syscalls:landlock_test_native (41 packages loaded, 57457 targets configured).
++[1 / 1] no actions running
++[3,714 / 3,729] Compiling test/syscalls/linux/landlock.cc; 0s linux-sandbox ... (2 actions running)
++[3,715 / 3,729] GoLink runsc/checkpointgofer/checkpointgofer_binary_/checkpointgofer_binary; 1s linux-sandbox ... (2 actions, 1 running)
++[3,728 / 3,729] [Prepa] GoLink runsc/runsc_/runsc
++[3,728 / 3,729] GoLink runsc/runsc_/runsc; 1s linux-sandbox
++INFO: Found 1 test target...
++Target //test/syscalls:landlock_test_native up-to-date:
++  bazel-bin/test/syscalls/landlock_test_native
++INFO: Elapsed time: 9.024s, Critical Path: 5.27s
++INFO: 8 processes: 3728 action cache hit, 1 internal, 7 linux-sandbox.
++INFO: Build completed successfully, 8 total actions
++INFO: 
++//test/syscalls:landlock_test_native                                     PASSED in 0.1s
++
++Executed 1 out of 1 test: 1 test passes.
++There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.
++INFO: Build Event Protocol files produced successfully.
++
++=== END NATIVE TEST: //test/syscalls:landlock_test_native ===
++
++=== RUNNING GVISOR TEST: //test/syscalls:landlock_test_runsc_systrap_directfs ===
++--- TAG default
++--- DOCKER BUILD
++gvisor-builder-d8c1358a-x86_64
++sha256:621979110835b702092bc69ed57bfdff18f1148b755d9255252903cb9fe0d948
++--- DOCKER RUN
++gvisor-bazel-d8c1358a-x86_64
++19925df2e7e624fcf956f3f9a9c81068fe98e45b03e81bf130caaf56e6bd285a
++--- COPY //runsc /tmp/v1.1/runsc
++Another command holds the output base lock: 
++pid=2989735
++owner=client
++cwd=/usr/local/google/home/aaltinay/kcp/gvisor
++
++Waiting for it to complete...
++Another command (pid=2989735) is running. Waiting for it to complete on the server (server_pid=2989797)...
++Computing main repo mapping: 
++WARNING: For repository 'bazel_skylib', the root module requires module version bazel_skylib@1.7.1, but got bazel_skylib@1.8.2 in the resolved dependency graph. Please update the version in your MODULE.bazel or set --check_direct_dependencies=off
++Computing main repo mapping: 
++Loading: 
++Loading: 2 packages loaded
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++Analyzing: target //runsc:runsc (3 packages loaded, 0 targets configured)
++
++Analyzing: target //runsc:runsc (89 packages loaded, 2700 targets configured)
++
++Analyzing: target //runsc:runsc (408 packages loaded, 15336 targets configured)
++
++Analyzing: target //runsc:runsc (1176 packages loaded, 48927 targets configured)
++
++INFO: Analyzed target //runsc:runsc (1177 packages loaded, 56900 targets configured).
++[184 / 941] checking cached actions
++[3,455 / 3,468] [Prepa] GoLink runsc/checkpointgofer/checkpointgofer_binary_/checkpointgofer_binary
++[3,456 / 3,468] checking cached actions
++[3,467 / 3,468] GoLink runsc/runsc_/runsc; 0s linux-sandbox
++INFO: Found 1 target...
++[3,468 / 3,468] no actions running
++Target //runsc:runsc up-to-date:
++  bazel-bin/runsc/runsc_/runsc
++INFO: Elapsed time: 13.011s, Critical Path: 4.29s
++INFO: 5 processes: 3470 action cache hit, 1 internal, 4 linux-sandbox.
++INFO: Build completed successfully, 5 total actions
++Computing main repo mapping: 
++Loading: 
++Loading: 0 packages loaded
++Analyzing: target //runsc:runsc (0 packages loaded, 0 targets configured)
++INFO: Analyzed target //runsc:runsc (0 packages loaded, 0 targets configured).
++INFO: Found 1 target...
++INFO: Elapsed time: 0.425s, Critical Path: 0.00s
++INFO: 0 processes.
++INFO: Build completed successfully, 0 total actions
++--- TEST --test_env=RUNTIME=/tmp/v1.1/runsc --cxxopt=-Werror --test_env=PARTITION=1 --test_env=TOTAL_PARTITIONS=1 -- //test/syscalls:landlock_test_runsc_systrap_directfs
++Computing main repo mapping: 
++Loading: 
++Loading: 0 packages loaded
++WARNING: Build options --cxxopt, --strip, and --test_env have changed, discarding analysis cache (this can be expensive, see https://bazel.build/advanced/performance/iteration-speed).
++Analyzing: target //test/syscalls:landlock_test_runsc_systrap_directfs (1 packages loaded, 0 targets configured)
++Analyzing: target //test/syscalls:landlock_test_runsc_systrap_directfs (1 packages loaded, 0 targets configured)
++
++INFO: Analyzed target //test/syscalls:landlock_test_runsc_systrap_directfs (41 packages loaded, 57457 targets configured).
++
++[3,716 / 3,729] GoLink runsc/checkpointgofer/checkpointgofer_binary_/checkpointgofer_binary; 0s linux-sandbox
++[3,717 / 3,729] [Prepa] Executing genrule //runsc/checkpointgofer:checkpointgofer_noflate
++[3,728 / 3,729] GoLink runsc/runsc_/runsc; 0s linux-sandbox
++[3,729 / 3,730] [Prepa] Testing //test/syscalls:landlock_test_runsc_systrap_directfs
++INFO: Found 1 test target...
++Target //test/syscalls:landlock_test_runsc_systrap_directfs up-to-date:
++  bazel-bin/test/syscalls/landlock_test_runsc_systrap_directfs
++INFO: Elapsed time: 9.159s, Critical Path: 5.21s
++INFO: 7 processes: 3729 action cache hit, 2 internal, 5 linux-sandbox.
++INFO: Build completed successfully, 7 total actions
++INFO: 
++//test/syscalls:landlock_test_runsc_systrap_directfs                     PASSED in 0.4s
++
++Executed 1 out of 1 test: 1 test passes.
++There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.
++INFO: Build Event Protocol files produced successfully.
++
++=== END GVISOR TEST: //test/syscalls:landlock_test_runsc_systrap_directfs ===
+diff --git a/pkg/abi/linux/BUILD b/pkg/abi/linux/BUILD
+index b6e5a5dd2..4cfe96b9c 100644
+--- a/pkg/abi/linux/BUILD
++++ b/pkg/abi/linux/BUILD
+@@ -42,6 +42,7 @@ go_library(
+         "ip.go",
+         "ipc.go",
+         "keyctl.go",
++        "landlock.go",
+         "limits.go",
+         "linux.go",
+         "membarrier.go",
+diff --git a/pkg/abi/linux/landlock.go b/pkg/abi/linux/landlock.go
+new file mode 100644
+index 000000000..447f0830a
+--- /dev/null
++++ b/pkg/abi/linux/landlock.go
+@@ -0,0 +1,90 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package linux
++
++// LandlockRulesetAttr defines the ruleset attributes.
++//
++// Matches Linux include/uapi/linux/landlock.h:struct landlock_ruleset_attr
++//
++// +marshal
++type LandlockRulesetAttr struct {
++	HandledAccessFS  uint64
++	HandledAccessNet uint64
++	Scoped           uint64
++}
++
++// LandlockPathBeneathAttr defines path hierarchy details.
++//
++// Matches Linux include/uapi/linux/landlock.h:struct landlock_path_beneath_attr
++//
++// +marshal
++type LandlockPathBeneathAttr struct {
++	AllowedAccess uint64
++	ParentFD      int32
++}
++
++// Landlock rule types.
++//
++// Matches Linux include/uapi/linux/landlock.h:enum landlock_rule_type
++const (
++	LANDLOCK_RULE_PATH_BENEATH = 1
++	LANDLOCK_RULE_NET_PORT     = 2
++)
++
++// Flags for landlock_create_ruleset.
++//
++// Matches Linux include/uapi/linux/landlock.h:landlock_create_ruleset_flags
++const (
++	LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
++	LANDLOCK_CREATE_RULESET_ERRATA  = 1 << 1
++)
++
++// Filesystem access rights.
++//
++// Matches Linux include/uapi/linux/landlock.h:fs_access
++const (
++	LANDLOCK_ACCESS_FS_EXECUTE     = 1 << 0
++	LANDLOCK_ACCESS_FS_WRITE_FILE  = 1 << 1
++	LANDLOCK_ACCESS_FS_READ_FILE   = 1 << 2
++	LANDLOCK_ACCESS_FS_READ_DIR    = 1 << 3
++	LANDLOCK_ACCESS_FS_REMOVE_DIR  = 1 << 4
++	LANDLOCK_ACCESS_FS_REMOVE_FILE = 1 << 5
++	LANDLOCK_ACCESS_FS_MAKE_CHAR   = 1 << 6
++	LANDLOCK_ACCESS_FS_MAKE_DIR    = 1 << 7
++	LANDLOCK_ACCESS_FS_MAKE_REG    = 1 << 8
++	LANDLOCK_ACCESS_FS_MAKE_SOCK   = 1 << 9
++	LANDLOCK_ACCESS_FS_MAKE_FIFO   = 1 << 10
++	LANDLOCK_ACCESS_FS_MAKE_BLOCK  = 1 << 11
++	LANDLOCK_ACCESS_FS_MAKE_SYM    = 1 << 12
++	LANDLOCK_ACCESS_FS_REFER       = 1 << 13
++	LANDLOCK_ACCESS_FS_TRUNCATE    = 1 << 14
++	LANDLOCK_ACCESS_FS_IOCTL_DEV   = 1 << 15
++)
++
++// Landlock v1 filesystem mask.
++// Matches Linux security/landlock/limits.h:LANDLOCK_MASK_ACCESS_FS for ABI v1.
++const LANDLOCK_MASK_ACCESS_FS = LANDLOCK_ACCESS_FS_EXECUTE |
++	LANDLOCK_ACCESS_FS_WRITE_FILE |
++	LANDLOCK_ACCESS_FS_READ_FILE |
++	LANDLOCK_ACCESS_FS_READ_DIR |
++	LANDLOCK_ACCESS_FS_REMOVE_DIR |
++	LANDLOCK_ACCESS_FS_REMOVE_FILE |
++	LANDLOCK_ACCESS_FS_MAKE_CHAR |
++	LANDLOCK_ACCESS_FS_MAKE_DIR |
++	LANDLOCK_ACCESS_FS_MAKE_REG |
++	LANDLOCK_ACCESS_FS_MAKE_SOCK |
++	LANDLOCK_ACCESS_FS_MAKE_FIFO |
++	LANDLOCK_ACCESS_FS_MAKE_BLOCK |
++	LANDLOCK_ACCESS_FS_MAKE_SYM
+diff --git a/pkg/sentry/fsimpl/gofer/gofer.go b/pkg/sentry/fsimpl/gofer/gofer.go
+index 8777d8aa5..ebf40c334 100644
+--- a/pkg/sentry/fsimpl/gofer/gofer.go
++++ b/pkg/sentry/fsimpl/gofer/gofer.go
+@@ -2392,3 +2392,11 @@ func (rp *resolvingPath) copy() resolvingPath {
+ func (rp *resolvingPath) getComponents(emit func(string) bool) {
+ 	rp.GetComponents(rp.excludeLast, emit)
+ }
++
++// WalkAncestors implements vfs.AncestorsWalker.
++func (fs *filesystem) WalkAncestors(ctx context.Context, d *vfs.Dentry, cb func(*vfs.Dentry) bool) error {
++	WalkAncestors(fs, d.Impl().(*dentry), func(curr *dentry) bool {
++		return cb(&curr.vfsd)
++	})
++	return nil
++}
+diff --git a/pkg/sentry/fsimpl/kernfs/filesystem.go b/pkg/sentry/fsimpl/kernfs/filesystem.go
+index 20d351cb9..11c0a7b46 100644
+--- a/pkg/sentry/fsimpl/kernfs/filesystem.go
++++ b/pkg/sentry/fsimpl/kernfs/filesystem.go
+@@ -1215,3 +1215,11 @@ func (fs *Filesystem) deferDecRefVD(ctx context.Context, vd vfs.VirtualDentry) {
+ 		vd.DecRef(ctx)
+ 	}
+ }
++
++// WalkAncestors implements vfs.AncestorsWalker.
++func (fs *Filesystem) WalkAncestors(ctx context.Context, d *vfs.Dentry, cb func(*vfs.Dentry) bool) error {
++	genericWalkAncestors(fs, d.Impl().(*Dentry), func(curr *Dentry) bool {
++		return cb(curr.VFSDentry())
++	})
++	return nil
++}
+diff --git a/pkg/sentry/fsimpl/tmpfs/tmpfs.go b/pkg/sentry/fsimpl/tmpfs/tmpfs.go
+index 184ad3511..930a95f58 100644
+--- a/pkg/sentry/fsimpl/tmpfs/tmpfs.go
++++ b/pkg/sentry/fsimpl/tmpfs/tmpfs.go
+@@ -1170,3 +1170,12 @@ func parseSize(s string) (uint64, bool, error) {
+ 	}
+ 	return bytes, percentageUsed, err
+ }
++
++// WalkAncestors implements vfs.AncestorsWalker.
++func (fs *filesystem) WalkAncestors(ctx context.Context, d *vfs.Dentry, cb func(*vfs.Dentry) bool) error {
++	WalkAncestors(fs, d.Impl().(*dentry), func(curr *dentry) bool {
++		return cb(&curr.vfsd)
++	})
++	return nil
++}
++
+diff --git a/pkg/sentry/kernel/auth/credentials.go b/pkg/sentry/kernel/auth/credentials.go
+index 70442e38a..616031c13 100644
+--- a/pkg/sentry/kernel/auth/credentials.go
++++ b/pkg/sentry/kernel/auth/credentials.go
+@@ -58,8 +58,19 @@ type Credentials struct {
+ 
+ 	// The user namespace associated with the owner of the credentials.
+ 	UserNamespace *UserNamespace
++
++	// Security is the security module context associated with these credentials.
++	Security SecurityObject
++}
++
++// SecurityObject defines the interface that security modules must implement if they
++// store objects in the Credentials.Security field.
++type SecurityObject interface {
++	// Clone returns a new reference or copy of the security object.
++	Clone() SecurityObject
+ }
+ 
++
+ // NewAnonymousCredentials returns a set of credentials with no capabilities in
+ // any user namespace.
+ func NewAnonymousCredentials() *Credentials {
+@@ -149,6 +160,9 @@ func NewUserCredentials(kuid KUID, kgid KGID, extraKGIDs []KGID, capabilities *T
+ func (c *Credentials) Fork() *Credentials {
+ 	nc := new(Credentials)
+ 	*nc = *c // Copy-by-value; this is legal for all fields.
++	if nc.Security != nil {
++		nc.Security = nc.Security.Clone()
++	}
+ 	return nc
+ }
+ 
+diff --git a/pkg/sentry/kernel/task.go b/pkg/sentry/kernel/task.go
+index 3d07b6c7a..dc594f9b5 100644
+--- a/pkg/sentry/kernel/task.go
++++ b/pkg/sentry/kernel/task.go
+@@ -946,3 +946,23 @@ func (t *Task) SetCoredumpFilter(coredumpFilter uint32) {
+ func (t *Task) GetCoredumpFilter() uint32 {
+ 	return t.tg.coredumpFilter.Load()
+ }
++
++// UpdateCredentials updates the task's credentials and handles Landlock domain lifecycle.
++func (t *Task) UpdateCredentials(newCreds *auth.Credentials) {
++	oldCreds := t.Credentials()
++	t.creds.Store(newCreds)
++	t.onCredentialsUpdated(oldCreds, newCreds)
++}
++
++func (t *Task) onCredentialsUpdated(oldCreds, newCreds *auth.Credentials) {
++	if oldCreds != nil && oldCreds.Security != nil {
++		if rc, ok := oldCreds.Security.(interface{ DecRef() }); ok {
++			rc.DecRef()
++		}
++	}
++	if newCreds != nil && newCreds.Security != nil {
++		if rc, ok := newCreds.Security.(interface{ IncRef() }); ok {
++			rc.IncRef()
++		}
++	}
++}
+diff --git a/pkg/sentry/kernel/task_clone.go b/pkg/sentry/kernel/task_clone.go
+index a20a39c42..1bccbf84b 100644
+--- a/pkg/sentry/kernel/task_clone.go
++++ b/pkg/sentry/kernel/task_clone.go
+@@ -795,7 +795,7 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
+ 	// Store replaced resources in nss so that they're cleaned up by the deferred function.
+ 	t.mu.Lock()
+ 	if nss.userNS != nil {
+-		t.creds.Store(checkCreds)
++		t.UpdateCredentials(checkCreds)
+ 		nss.userNS = creds.UserNamespace
+ 	}
+ 	if nss.childPIDNS != nil {
+@@ -953,7 +953,7 @@ func (t *Task) Unshare(flags int32) error {
+ 	t.mu.Lock()
+ 	defer t.mu.Unlock()
+ 	if newCreds {
+-		t.creds.Store(creds)
++		t.UpdateCredentials(creds)
+ 		newUserNS = originalUserNS
+ 	}
+ 	if newFSContext != nil {
+diff --git a/pkg/sentry/kernel/task_exec.go b/pkg/sentry/kernel/task_exec.go
+index 23b080129..70feb3cbf 100644
+--- a/pkg/sentry/kernel/task_exec.go
++++ b/pkg/sentry/kernel/task_exec.go
+@@ -385,7 +385,7 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
+ 	t.p.PrepareExecve()
+ 	// Update credentials to reflect the execve. This should precede switching
+ 	// MMs to ensure that dumpability has been reset first, if needed.
+-	t.creds.Store(r.newCreds)
++	t.UpdateCredentials(r.newCreds)
+ 	t.mu.Lock()
+ 	oldImage := t.image
+ 	t.image = *r.image
+diff --git a/pkg/sentry/kernel/task_exit.go b/pkg/sentry/kernel/task_exit.go
+index a3e730fd2..9e1e3e529 100644
+--- a/pkg/sentry/kernel/task_exit.go
++++ b/pkg/sentry/kernel/task_exit.go
+@@ -820,6 +820,8 @@ func (t *Task) UnregisterOnDestroyAction(key TaskDestroyAction) {
+ }
+ 
+ func (t *Task) execOnDestroyActions() {
++	t.UpdateCredentials(nil)
++
+ 	t.mu.Lock()
+ 	actions := t.onDestroyAction
+ 	t.onDestroyAction = nil
+diff --git a/pkg/sentry/kernel/task_identity.go b/pkg/sentry/kernel/task_identity.go
+index 9b2a690bf..f7cdad160 100644
+--- a/pkg/sentry/kernel/task_identity.go
++++ b/pkg/sentry/kernel/task_identity.go
+@@ -222,7 +222,7 @@ func (t *Task) setKUIDsUnchecked(newR, newE, newS auth.KUID) {
+ 		// Not documented, but compare Linux's kernel/cred.c:commit_creds().
+ 		t.parentDeathSignal = 0
+ 	}
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ }
+ 
+ // SetGID implements the semantics of setgid(2).
+@@ -336,7 +336,7 @@ func (t *Task) setKGIDsUnchecked(newR, newE, newS auth.KGID) {
+ 		// kernel/cred.c:commit_creds().
+ 		t.parentDeathSignal = 0
+ 	}
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ }
+ 
+ // SetExtraGIDs attempts to change t's supplemental groups. All IDs are
+@@ -360,7 +360,7 @@ func (t *Task) SetExtraGIDs(gids []auth.GID) error {
+ 	}
+ 	creds = creds.Fork() // The credentials object is immutable. See doc for creds.
+ 	creds.ExtraKGIDs = kgids
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ 	return nil
+ }
+ 
+@@ -407,7 +407,7 @@ func (t *Task) SetCapabilitySets(permitted, inheritable, effective auth.Capabili
+ 	creds.InheritableCaps = inheritable
+ 	creds.EffectiveCaps = effective
+ 	creds.AmbientCaps &= permitted & inheritable
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ 	return nil
+ }
+ 
+@@ -422,7 +422,7 @@ func (t *Task) DropBoundingCapability(cp linux.Capability) error {
+ 	}
+ 	creds = creds.Fork() // The credentials object is immutable. See doc for creds.
+ 	creds.BoundingCaps &^= auth.CapabilitySetOf(cp)
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ 	return nil
+ }
+ 
+@@ -434,7 +434,7 @@ func (t *Task) SetKeepCaps(k bool) {
+ 	defer t.mu.Unlock()
+ 	creds := t.Credentials().Fork() // The credentials object is immutable. See doc for creds.
+ 	creds.KeepCaps = k
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ }
+ 
+ // PrivilegedSecureBits is the set of securebits that are privileged.
+@@ -509,7 +509,7 @@ func (t *Task) RaiseAmbientCapability(cp linux.Capability) error {
+ 	}
+ 	creds = creds.Fork()
+ 	creds.AmbientCaps |= cs
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ 	return nil
+ }
+ 
+@@ -520,7 +520,7 @@ func (t *Task) LowerAmbientCapability(cp linux.Capability) error {
+ 	}
+ 	creds := t.Credentials().Fork()
+ 	creds.AmbientCaps &^= auth.CapabilitySetOf(cp)
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ 	return nil
+ }
+ 
+@@ -528,5 +528,5 @@ func (t *Task) LowerAmbientCapability(cp linux.Capability) error {
+ func (t *Task) ClearAmbientCapabilities() {
+ 	creds := t.Credentials().Fork()
+ 	creds.AmbientCaps = 0
+-	t.creds.Store(creds)
++	t.UpdateCredentials(creds)
+ }
+diff --git a/pkg/sentry/kernel/task_start.go b/pkg/sentry/kernel/task_start.go
+index 62c6fd7fb..2521339d2 100644
+--- a/pkg/sentry/kernel/task_start.go
++++ b/pkg/sentry/kernel/task_start.go
+@@ -232,7 +232,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error)
+ 		cgroup2:         cgroup2,
+ 	}
+ 	t.netns = cfg.NetworkNamespace
+-	t.creds.Store(cfg.Credentials)
++	t.UpdateCredentials(cfg.Credentials)
+ 	t.fsContext.Store(cfg.FSContext)
+ 	t.endStopCond.L = &t.tg.signalHandlers.mu
+ 	// We don't construct t.blockingTimer until Task.run(); see that function
+diff --git a/pkg/sentry/landlock/ruleset.go b/pkg/sentry/landlock/ruleset.go
+new file mode 100644
+index 000000000..1b6b15f6b
+--- /dev/null
++++ b/pkg/sentry/landlock/ruleset.go
+@@ -0,0 +1,175 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package landlock
++
++import (
++	"gvisor.dev/gvisor/pkg/abi/linux"
++	"gvisor.dev/gvisor/pkg/context"
++	"gvisor.dev/gvisor/pkg/errors/linuxerr"
++	"gvisor.dev/gvisor/pkg/refs"
++	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
++	"gvisor.dev/gvisor/pkg/sentry/vfs"
++	"gvisor.dev/gvisor/pkg/sync"
++)
++
++// Ruleset represents a Landlock ruleset under construction.
++//
++// Matches Linux security/landlock/ruleset.h:struct landlock_ruleset.
++type Ruleset struct {
++	// mu protects the fields below.
++	mu sync.Mutex
++
++	// handledAccessFS is the set of filesystem access rights handled by this ruleset.
++	handledAccessFS uint64
++
++	// rules maps a Dentry to its allowed access mask in this ruleset.
++	// Since rules are added by path, we hold a reference to each dentry in the map.
++	rules map[*vfs.Dentry]uint64
++}
++
++// NewRuleset creates a new Ruleset.
++func NewRuleset(handledAccessFS uint64) *Ruleset {
++	return &Ruleset{
++		handledAccessFS: handledAccessFS,
++		rules:           make(map[*vfs.Dentry]uint64),
++	}
++}
++
++// AddRule adds a path beneath rule to the ruleset.
++func (r *Ruleset) AddRule(d *vfs.Dentry, allowedAccess uint64) error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	// allowedAccess must be a subset of handledAccessFS.
++	if (allowedAccess | r.handledAccessFS) != r.handledAccessFS {
++		return linuxerr.EINVAL
++	}
++
++	if oldAccess, ok := r.rules[d]; ok {
++		r.rules[d] = oldAccess | allowedAccess
++	} else {
++		d.IncRef()
++		r.rules[d] = allowedAccess
++	}
++	return nil
++}
++
++// HandledAccessFS returns the handled filesystem access rights of this ruleset.
++func (r *Ruleset) HandledAccessFS() uint64 {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.handledAccessFS
++}
++
++// Freeze returns a new, read-only copy of the Ruleset for use in a Domain.
++// It increments references of all dentries in the copied rules map.
++func (r *Ruleset) Freeze() *Ruleset {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	frozen := &Ruleset{
++		handledAccessFS: r.handledAccessFS,
++		rules:           make(map[*vfs.Dentry]uint64),
++	}
++	for d, access := range r.rules {
++		d.IncRef()
++		frozen.rules[d] = access
++	}
++	return frozen
++}
++
++// RulesetFileDescription implements vfs.FileDescriptionImpl for the anonymous
++// file descriptor representing a Landlock ruleset.
++type RulesetFileDescription struct {
++	vfs.FileDescriptionDefaultImpl
++	vfs.DentryMetadataFileDescriptionImpl
++	vfs.NoLockFD
++
++	ruleset *Ruleset
++}
++
++// NewRulesetFD creates a new anonymous file descriptor representing a Ruleset.
++func NewRulesetFD(vfsObj *vfs.VirtualFilesystem, r *Ruleset) (*vfs.FileDescription, error) {
++	vd := vfsObj.NewAnonVirtualDentry("[landlock-ruleset]")
++	defer vd.DecRef(context.Background())
++
++	fd := &RulesetFileDescription{
++		ruleset: r,
++	}
++	if err := fd.vfsfd.Init(fd, linux.O_RDWR, auth.CredentialsFromContext(context.Background()), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
++		DenyPRead:         true,
++		DenyPWrite:        true,
++		UseDentryMetadata: true,
++	}); err != nil {
++		return nil, err
++	}
++	return &fd.vfsfd, nil
++}
++
++// Release implements vfs.FileDescriptionImpl.Release.
++func (fd *RulesetFileDescription) Release(ctx context.Context) {
++	fd.ruleset.mu.Lock()
++	defer fd.ruleset.mu.Unlock()
++
++	// Release references to all dentries.
++	for d := range fd.ruleset.rules {
++		d.DecRef(ctx)
++	}
++	fd.ruleset.rules = nil
++}
++
++// GetRulesetFromFD extracts the Ruleset from a file description.
++func GetRulesetFromFD(fd *vfs.FileDescription) (*Ruleset, error) {
++	impl, ok := fd.Impl().(*RulesetFileDescription)
++	if !ok {
++		return nil, linuxerr.EBADFD
++	}
++	return impl.ruleset, nil
++}
++
++// Domain represents an immutable stacked ruleset hierarchy.
++//
++// Matches Linux security/landlock/ruleset.h:struct landlock_ruleset (used as a domain).
++type Domain struct {
++	refs.AtomicRefCount
++	layers []*Ruleset
++}
++
++// NewDomain creates a new Domain from a slice of frozen rulesets.
++func NewDomain(layers []*Ruleset) *Domain {
++	d := &Domain{
++		layers: layers,
++	}
++	d.EnableWarning(true)
++	return d
++}
++
++// Clone implements auth.SecurityObject.Clone.
++func (d *Domain) Clone() auth.SecurityObject {
++	d.IncRef()
++	return d
++}
++
++// DecRef implements auth.SecurityObject.DecRef (wrapped in refs.AtomicRefCount).
++func (d *Domain) DecRef(ctx context.Context) {
++	d.DecRefWithDestructor(ctx, func(ctx context.Context) {
++		// Release references to all dentries in all layers.
++		for _, layer := range d.layers {
++			for dentry := range layer.rules {
++				dentry.DecRef(ctx)
++			}
++		}
++	})
++}
+diff --git a/pkg/sentry/syscalls/linux/linux64.go b/pkg/sentry/syscalls/linux/linux64.go
+index a50f464fb..c0cfe2227 100644
+--- a/pkg/sentry/syscalls/linux/linux64.go
++++ b/pkg/sentry/syscalls/linux/linux64.go
+@@ -398,6 +398,9 @@ var AMD64 = &kernel.SyscallTable{
+ 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
+ 		439: syscalls.Supported("faccessat2", Faccessat2),
+ 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
++		444: syscalls.Supported("landlock_create_ruleset", LandlockCreateRuleset),
++		445: syscalls.Supported("landlock_add_rule", LandlockAddRule),
++		446: syscalls.Supported("landlock_restrict_self", LandlockRestrictSelf),
+ 	},
+ 	Emulate: map[hostarch.Addr]uintptr{
+ 		0xffffffffff600000: 96,  // vsyscall gettimeofday(2)
+@@ -720,6 +723,9 @@ var ARM64 = &kernel.SyscallTable{
+ 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
+ 		439: syscalls.Supported("faccessat2", Faccessat2),
+ 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
++		444: syscalls.Supported("landlock_create_ruleset", LandlockCreateRuleset),
++		445: syscalls.Supported("landlock_add_rule", LandlockAddRule),
++		446: syscalls.Supported("landlock_restrict_self", LandlockRestrictSelf),
+ 	},
+ 	Emulate: map[hostarch.Addr]uintptr{},
+ 	Missing: func(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+diff --git a/pkg/sentry/syscalls/linux/sys_landlock.go b/pkg/sentry/syscalls/linux/sys_landlock.go
+new file mode 100644
+index 000000000..7a76781cf
+--- /dev/null
++++ b/pkg/sentry/syscalls/linux/sys_landlock.go
+@@ -0,0 +1,173 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package linux
++
++import (
++	"gvisor.dev/gvisor/pkg/abi/linux"
++	"gvisor.dev/gvisor/pkg/errors/linuxerr"
++	"gvisor.dev/gvisor/pkg/sentry/arch"
++	"gvisor.dev/gvisor/pkg/sentry/kernel"
++	"gvisor.dev/gvisor/pkg/sentry/landlock"
++)
++
++var sizeofLandlockRulesetAttr = (*linux.LandlockRulesetAttr)(nil).SizeBytes()
++
++// LandlockCreateRuleset implements linux syscall landlock_create_ruleset(2).
++func LandlockCreateRuleset(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
++	addr := args[0].Pointer()
++	size := args[1].SizeT()
++	flags := args[2].Uint()
++
++	if flags&linux.LANDLOCK_CREATE_RULESET_VERSION != 0 {
++		return 1, nil, nil // We support ABI v1
++	}
++
++	if flags != 0 {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	minSize := uint(sizeofLandlockRulesetAttr)
++	if size < minSize {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	var attr linux.LandlockRulesetAttr
++	if _, err := attr.CopyIn(t, addr); err != nil {
++		return 0, nil, err
++	}
++
++	// We only support FS access rights in ABI v1.
++	if attr.HandledAccessNet != 0 || attr.Scoped != 0 {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	// Only allow access rights defined in ABI v1.
++	if attr.HandledAccessFS&^linux.LANDLOCK_MASK_ACCESS_FS != 0 {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	ruleset := landlock.NewRuleset(attr.HandledAccessFS)
++	fd, err := landlock.NewRulesetFD(t.Kernel().VFS(), ruleset)
++	if err != nil {
++		return 0, nil, err
++	}
++	defer fd.DecRef(t)
++
++	newFD, err := t.NewFDFrom(0, fd, kernel.FDFlags{
++		CloseOnExec: true, // Landlock FDs are close-on-exec by default
++	})
++	if err != nil {
++		return 0, nil, err
++	}
++
++	return uintptr(newFD), nil, nil
++}
++
++// LandlockAddRule implements linux syscall landlock_add_rule(2).
++func LandlockAddRule(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
++	rulesetFD := args[0].Int()
++	ruleType := args[1].Int()
++	ruleAttrAddr := args[2].Pointer()
++	flags := args[3].Uint()
++
++	if flags != 0 {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	if ruleType != linux.LANDLOCK_RULE_PATH_BENEATH {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	// Retrieve Ruleset from rulesetFD.
++	rulesetFile := t.GetFile(rulesetFD)
++	if rulesetFile == nil {
++		return 0, nil, linuxerr.EBADF
++	}
++	defer rulesetFile.DecRef(t)
++
++	ruleset, err := landlock.GetRulesetFromFD(rulesetFile)
++	if err != nil {
++		return 0, nil, err
++	}
++
++	var attr linux.LandlockPathBeneathAttr
++	if _, err := attr.CopyIn(t, ruleAttrAddr); err != nil {
++		return 0, nil, err
++	}
++
++	// Get target dentry from ParentFD.
++	parentFile := t.GetFile(attr.ParentFD)
++	if parentFile == nil {
++		return 0, nil, linuxerr.EBADF
++	}
++	defer parentFile.DecRef(t)
++
++	parentVD := parentFile.VirtualDentry()
++
++	// Add rule to ruleset.
++	if err := ruleset.AddRule(parentVD.Dentry(), attr.AllowedAccess); err != nil {
++		return 0, nil, err
++	}
++
++	return 0, nil, nil
++}
++
++// LandlockRestrictSelf implements linux syscall landlock_restrict_self(2).
++func LandlockRestrictSelf(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
++	rulesetFD := args[0].Int()
++	flags := args[1].Uint()
++
++	if flags != 0 {
++		return 0, nil, linuxerr.EINVAL
++	}
++
++	// Check no_new_privs or CAP_SYS_ADMIN in user namespace.
++	if !t.NoNewPrivs() && !t.Credentials().HasCapabilityIn(linux.CAP_SYS_ADMIN, t.UserNamespace()) {
++		return 0, nil, linuxerr.EPERM
++	}
++
++	// Retrieve Ruleset from rulesetFD.
++	rulesetFile := t.GetFile(rulesetFD)
++	if rulesetFile == nil {
++		return 0, nil, linuxerr.EBADF
++	}
++	defer rulesetFile.DecRef(t)
++
++	ruleset, err := landlock.GetRulesetFromFD(rulesetFile)
++	if err != nil {
++		return 0, nil, err
++	}
++
++	// Freeze the ruleset.
++	frozenRuleset := ruleset.Freeze()
++
++	// Fork credentials.
++	creds := t.Credentials().Fork()
++
++	var newDomain *landlock.Domain
++	if creds.Security == nil {
++		newDomain = landlock.NewDomain([]*landlock.Ruleset{frozenRuleset})
++	} else {
++		oldDomain, ok := creds.Security.(*landlock.Domain)
++		if !ok {
++			return 0, nil, linuxerr.EPERM
++		}
++		newDomain = oldDomain.Merge(frozenRuleset)
++	}
++
++	creds.Security = newDomain
++	t.UpdateCredentials(creds)
++	return 0, nil, nil
++}
+diff --git a/pkg/sentry/vfs/BUILD b/pkg/sentry/vfs/BUILD
+index e46acc322..85919e337 100644
+--- a/pkg/sentry/vfs/BUILD
++++ b/pkg/sentry/vfs/BUILD
+@@ -152,6 +152,7 @@ go_library(
+         "inotify_event_mutex.go",
+         "inotify_mutex.go",
+         "lock.go",
++        "landlock.go",
+         "mount.go",
+         "mount_list.go",
+         "mount_namespace_refs.go",
+diff --git a/pkg/sentry/vfs/anonfs.go b/pkg/sentry/vfs/anonfs.go
+index f42b7f746..9157252aa 100644
+--- a/pkg/sentry/vfs/anonfs.go
++++ b/pkg/sentry/vfs/anonfs.go
+@@ -334,3 +334,9 @@ func (d *anonDentry) Watches() *Watches {
+ 
+ // OnZeroWatches implements Dentry.OnZeroWatches.
+ func (d *anonDentry) OnZeroWatches(context.Context) {}
++
++// WalkAncestors implements FilesystemImpl.WalkAncestors.
++func (fs *anonFilesystem) WalkAncestors(ctx context.Context, d *Dentry, cb func(*Dentry) bool) error {
++	cb(d)
++	return nil
++}
+diff --git a/pkg/sentry/vfs/filesystem.go b/pkg/sentry/vfs/filesystem.go
+index e4f61d741..464252328 100644
+--- a/pkg/sentry/vfs/filesystem.go
++++ b/pkg/sentry/vfs/filesystem.go
+@@ -572,3 +572,13 @@ func (PrependPathSyntheticError) Error() string {
+ type HostFDProvider interface {
+ 	HostFD() int
+ }
++
++// AncestorsWalker is implemented by FilesystemImpls that support walking up
++// the ancestry chain of a dentry while holding the necessary internal filesystem
++// locks to prevent concurrent directory rename operations.
++type AncestorsWalker interface {
++	// WalkAncestors calls cb on d and each of its ancestors in the filesystem
++	// tree in order, starting with d. If cb returns false, walking stops.
++	// The walking MUST begin at d and proceed up to the filesystem root.
++	WalkAncestors(ctx context.Context, d *Dentry, cb func(*Dentry) bool) error
++}
+diff --git a/pkg/sentry/vfs/genericfstree/genericfstree.go b/pkg/sentry/vfs/genericfstree/genericfstree.go
+index 2d4b52fd2..fbf9eebb4 100644
+--- a/pkg/sentry/vfs/genericfstree/genericfstree.go
++++ b/pkg/sentry/vfs/genericfstree/genericfstree.go
+@@ -132,3 +132,16 @@ func DebugPathname(fs *Filesystem, d *Dentry) string {
+ 	_ = PrependPath(fs, vfs.VirtualDentry{}, nil, d, &b)
+ 	return b.String()
+ }
++
++// WalkAncestors walks up the parent chain of d and calls cb on each dentry.
++// It acquires ancestryMu read lock for the duration of the walk.
++func WalkAncestors(fs *Filesystem, d *Dentry, cb func(*Dentry) bool) {
++	fs.ancestryMu.RLock()
++	defer fs.ancestryMu.RUnlock()
++	for curr := d; curr != nil; curr = curr.parent.Load() {
++		if !cb(curr) {
++			break
++		}
++	}
++}
++
+diff --git a/pkg/sentry/vfs/landlock.go b/pkg/sentry/vfs/landlock.go
+new file mode 100644
+index 000000000..4631b6849
+--- /dev/null
++++ b/pkg/sentry/vfs/landlock.go
+@@ -0,0 +1,230 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package vfs
++
++import (
++	"gvisor.dev/gvisor/pkg/abi/linux"
++	"gvisor.dev/gvisor/pkg/context"
++	"gvisor.dev/gvisor/pkg/errors/linuxerr"
++	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
++)
++
++// LandlockDomain represents the interface that a Landlock domain must implement
++// to allow VFS to perform Landlock path verification checks.
++type LandlockDomain interface {
++	// NumLayers returns the number of layers in the domain.
++	NumLayers() int
++
++	// HandledAccessFS returns the handled filesystem access rights of the given layer.
++	HandledAccessFS(layer int) uint64
++
++	// GetRule returns the allowed access mask for a dentry in the given layer,
++	// and true if a rule exists.
++	GetRule(layer int, d *Dentry) (uint64, bool)
++}
++
++// CheckLandlockOpen checks Landlock permissions for open operations.
++func (vfs *VirtualFilesystem) CheckLandlockOpen(ctx context.Context, creds *auth.Credentials, vd VirtualDentry, flags uint32) error {
++	if creds.Security == nil {
++		return nil
++	}
++	domain, ok := creds.Security.(LandlockDomain)
++	if !ok {
++		return nil
++	}
++
++	// Map open flags to Landlock FS access rights.
++	var accessRequest uint64
++	accMode := flags & linux.O_ACCMODE
++	if accMode == linux.O_WRONLY || accMode == linux.O_RDWR {
++		accessRequest |= linux.LANDLOCK_ACCESS_FS_WRITE_FILE
++	}
++	if accMode == linux.O_RDONLY || accMode == linux.O_RDWR {
++		accessRequest |= linux.LANDLOCK_ACCESS_FS_READ_FILE
++	}
++	if flags&linux.O_DIRECTORY != 0 {
++		accessRequest |= linux.LANDLOCK_ACCESS_FS_READ_DIR
++	}
++
++	return vfs.checkLandlockPath(ctx, domain, vd, accessRequest)
++}
++
++// CheckLandlockPath checks Landlock permissions for a path.
++func (vfs *VirtualFilesystem) CheckLandlockPath(ctx context.Context, creds *auth.Credentials, vd VirtualDentry, accessRequest uint64) error {
++	if creds.Security == nil {
++		return nil
++	}
++	domain, ok := creds.Security.(LandlockDomain)
++	if !ok {
++		return nil
++	}
++	return vfs.checkLandlockPath(ctx, domain, vd, accessRequest)
++}
++
++func (vfs *VirtualFilesystem) checkLandlockPath(ctx context.Context, domain LandlockDomain, vd VirtualDentry, accessRequest uint64) error {
++	if accessRequest == 0 {
++		return nil
++	}
++
++	// Skip checks for mounts that are not user-visible (e.g. pipefs, sockfs).
++	if vd.mount.neverConnected() {
++		return nil
++	}
++
++	numLayers := domain.NumLayers()
++	if numLayers == 0 {
++		return nil
++	}
++
++	// Initialize layer masks.
++	// layerMasks[bit] is a bitmask of layers that restrict the access right at index 'bit'.
++	var layerMasks [16]uint16
++	var handledAccesses uint64
++
++	for layer := 0; layer < numLayers; layer++ {
++		layerBit := uint16(1 << layer)
++		handledFS := domain.HandledAccessFS(layer)
++
++		for bit := 0; bit < 16; bit++ {
++			accessBit := uint64(1 << bit)
++			if (accessRequest & accessBit) != 0 {
++				if (handledFS & accessBit) != 0 {
++					layerMasks[bit] |= layerBit
++					handledAccesses |= accessBit
++				}
++			}
++		}
++	}
++
++	// If none of the layers handle any of the requested accesses, it's allowed.
++	if handledAccesses == 0 {
++		return nil
++	}
++
++	// Resolve the task's VFS root to stop the walk when we reach it.
++	root := RootFromContext(ctx)
++	defer root.DecRef(ctx)
++
++	// Walk up the ancestry tree.
++	curr := vd
++	curr.IncRef()
++	defer curr.DecRef(ctx)
++
++	for {
++		// Check if the filesystem implements AncestorsWalker.
++		walker, ok := curr.dentry.impl.Filesystem().impl.(AncestorsWalker)
++		if !ok {
++			// If we can't walk ancestors, we must stop and fail.
++			return linuxerr.EACCES
++		}
++
++		var walkErr error
++		// Walk up within the current filesystem.
++		walkErr = walker.WalkAncestors(ctx, curr.dentry, func(d *Dentry) bool {
++			// Check if we hit the root of the task.
++			if curr.mount == root.Mount() && d == root.Dentry() {
++				// We hit the chroot boundary. Stop walking.
++				return false
++			}
++
++			// For each layer, check if there is a rule for this dentry.
++			for layer := 0; layer < numLayers; layer++ {
++				layerBit := uint16(1 << layer)
++				if allowedAccess, ok := domain.GetRule(layer, d); ok {
++					// Clear the layer's bit from all access rights that are allowed by this rule.
++					for bit := 0; bit < 16; bit++ {
++						accessBit := uint64(1 << bit)
++						if (allowedAccess & accessBit) != 0 {
++							layerMasks[bit] &^= layerBit
++						}
++					}
++				}
++			}
++
++			// Check if all layers have allowed all requested accesses.
++			allAllowed := true
++			for bit := 0; bit < 16; bit++ {
++				accessBit := uint64(1 << bit)
++				if (handledAccesses & accessBit) != 0 {
++					if layerMasks[bit] != 0 {
++						allAllowed = false
++						break
++					}
++				}
++			}
++			if allAllowed {
++				return false // stop walking
++			}
++
++			return true // continue walking up
++		})
++
++		if walkErr != nil {
++			return walkErr
++		}
++
++		// Check if we are done (all allowed).
++		allAllowed := true
++		for bit := 0; bit < 16; bit++ {
++			accessBit := uint64(1 << bit)
++			if (handledAccesses & accessBit) != 0 {
++				if layerMasks[bit] != 0 {
++					allAllowed = false
++					break
++				}
++			}
++		}
++		if allAllowed {
++			return nil
++		}
++
++		// If we reached the task chroot root, stop.
++		if curr.mount == root.Mount() && curr.dentry == root.Dentry() {
++			return linuxerr.EACCES
++		}
++
++		// If we reached the mount root, cross the mount boundary.
++		if curr.dentry == curr.mount.Root() {
++			parentVD := vfs.getMountpointAt(ctx, curr.mount, root)
++			if parentVD.Ok() {
++				curr.DecRef(ctx)
++				curr = parentVD
++				// parentVD is returned with a reference taken, so we just continue.
++				continue
++			} else {
++				// Reached the absolute root.
++				return linuxerr.EACCES
++			}
++		}
++
++		// If WalkAncestors finished without reaching the mount root or chroot, but we still aren't allowed:
++		if curr.dentry != curr.mount.Root() {
++			return linuxerr.EACCES
++		}
++	}
++}
++
++// isDir checks if the file represented by vd is a directory.
++func (vfs *VirtualFilesystem) isDir(ctx context.Context, creds *auth.Credentials, vd VirtualDentry) (bool, error) {
++	statVal, err := vfs.StatAt(ctx, creds, &PathOperation{Start: vd}, &StatOptions{
++		Mask: linux.STATX_TYPE,
++		Sync: linux.AT_STATX_DONT_SYNC,
++	})
++	if err != nil {
++		return false, err
++	}
++	return linux.FileMode(statVal.Mode).IsDir(), nil
++}
++
+diff --git a/pkg/sentry/vfs/vfs.go b/pkg/sentry/vfs/vfs.go
+index eeb8d426b..f9f5f8a2f 100644
+--- a/pkg/sentry/vfs/vfs.go
++++ b/pkg/sentry/vfs/vfs.go
+@@ -319,6 +319,43 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
+ 		return linuxerr.EINVAL
+ 	}
+ 
++	if creds.Security != nil {
++		oldParentVD, _, err := vfs.getParentDirAndName(ctx, creds, oldpop)
++		if err == nil {
++			newParentVD, _, err := vfs.getParentDirAndName(ctx, creds, newpop)
++			if err == nil {
++				if oldParentVD.mount != newParentVD.mount || oldParentVD.dentry != newParentVD.dentry {
++					oldParentVD.DecRef(ctx)
++					newParentVD.DecRef(ctx)
++					oldVD.DecRef(ctx)
++					return linuxerr.EXDEV
++				}
++				isDir, statErr := vfs.isDir(ctx, creds, oldVD)
++				if statErr != nil {
++					oldParentVD.DecRef(ctx)
++					newParentVD.DecRef(ctx)
++					oldVD.DecRef(ctx)
++					return statErr
++				}
++				var access uint64
++				if isDir {
++					access = linux.LANDLOCK_ACCESS_FS_MAKE_DIR
++				} else {
++					access = linux.LANDLOCK_ACCESS_FS_MAKE_REG
++				}
++				checkErr := vfs.CheckLandlockPath(ctx, creds, newParentVD, access)
++				oldParentVD.DecRef(ctx)
++				newParentVD.DecRef(ctx)
++				if checkErr != nil {
++					oldVD.DecRef(ctx)
++					return checkErr
++				}
++			} else {
++				oldParentVD.DecRef(ctx)
++			}
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, newpop)
+ 	defer rp.Release(ctx)
+ 	for {
+@@ -356,10 +393,19 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
+ 		ctx.Warningf("VirtualFilesystem.MkdirAt: file creation paths can't follow final symlink")
+ 		return linuxerr.EINVAL
+ 	}
+-	// "Under Linux, apart from the permission bits, the S_ISVTX mode bit is
+-	// also honored." - mkdir(2)
+ 	opts.Mode &= 0777 | linux.S_ISVTX
+ 
++	if creds.Security != nil {
++		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
++		if err == nil {
++			checkErr := vfs.CheckLandlockPath(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_DIR)
++			parentVD.DecRef(ctx)
++			if checkErr != nil {
++				return checkErr
++			}
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, pop)
+ 	defer rp.Release(ctx)
+ 	for {
+@@ -397,6 +443,30 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
+ 		return linuxerr.EINVAL
+ 	}
+ 
++	if creds.Security != nil {
++		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
++		if err == nil {
++			var access uint64
++			switch ft := opts.Mode.FileType(); ft {
++			case 0, linux.ModeRegular:
++				access = linux.LANDLOCK_ACCESS_FS_MAKE_REG
++			case linux.ModeCharacterDevice:
++				access = linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
++			case linux.ModeBlockDevice:
++				access = linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
++			case linux.ModeNamedPipe:
++				access = linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
++			case linux.ModeSocket:
++				access = linux.LANDLOCK_ACCESS_FS_MAKE_SOCK
++			}
++			checkErr := vfs.CheckLandlockPath(ctx, creds, parentVD, access)
++			parentVD.DecRef(ctx)
++			if checkErr != nil {
++				return checkErr
++			}
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, pop)
+ 	defer rp.Release(ctx)
+ 	for {
+@@ -473,6 +543,10 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
+ 		}
+ 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)
+ 		if err == nil {
++			if err := vfs.CheckLandlockOpen(ctx, creds, fd, opts.Flags); err != nil {
++				fd.DecRef(ctx)
++				return nil, err
++			}
+ 			if opts.FileExec {
+ 				if fd.Mount().Options().Flags.NoExec {
+ 					fd.DecRef(ctx)
+@@ -561,6 +635,49 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
+ 		return linuxerr.EINVAL
+ 	}
+ 
++	if creds.Security != nil {
++		newParentVD, _, err := vfs.getParentDirAndName(ctx, creds, newpop)
++		if err == nil {
++			if oldParentVD.mount != newParentVD.mount || oldParentVD.dentry != newParentVD.dentry {
++				oldParentVD.DecRef(ctx)
++				newParentVD.DecRef(ctx)
++				return linuxerr.EXDEV
++			}
++			// Same directory.
++			oldVD, err := vfs.GetDentryAt(ctx, creds, oldpop, &GetDentryOptions{})
++			if err == nil {
++				isDir, statErr := vfs.isDir(ctx, creds, oldVD)
++				if statErr != nil {
++					oldVD.DecRef(ctx)
++					oldParentVD.DecRef(ctx)
++					newParentVD.DecRef(ctx)
++					return statErr
++				}
++				var removeAccess, makeAccess uint64
++				if isDir {
++					removeAccess = linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
++					makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_DIR
++				} else {
++					removeAccess = linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
++					makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_REG
++				}
++				oldVD.DecRef(ctx)
++
++				if err := vfs.CheckLandlockPath(ctx, creds, oldParentVD, removeAccess); err != nil {
++					oldParentVD.DecRef(ctx)
++					newParentVD.DecRef(ctx)
++					return err
++				}
++				if err := vfs.CheckLandlockPath(ctx, creds, newParentVD, makeAccess); err != nil {
++					oldParentVD.DecRef(ctx)
++					newParentVD.DecRef(ctx)
++					return err
++				}
++			}
++			newParentVD.DecRef(ctx)
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, newpop)
+ 	defer rp.Release(ctx)
+ 	renameOpts := *opts
+@@ -603,6 +720,17 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
+ 		return linuxerr.EINVAL
+ 	}
+ 
++	if creds.Security != nil {
++		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
++		if err == nil {
++			checkErr := vfs.CheckLandlockPath(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR)
++			parentVD.DecRef(ctx)
++			if checkErr != nil {
++				return checkErr
++			}
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, pop)
+ 	defer rp.Release(ctx)
+ 	for {
+@@ -699,6 +827,17 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
+ 		return linuxerr.EINVAL
+ 	}
+ 
++	if creds.Security != nil {
++		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
++		if err == nil {
++			checkErr := vfs.CheckLandlockPath(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_SYM)
++			parentVD.DecRef(ctx)
++			if checkErr != nil {
++				return checkErr
++			}
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, pop)
+ 	defer rp.Release(ctx)
+ 	for {
+@@ -735,6 +874,17 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
+ 		return linuxerr.EINVAL
+ 	}
+ 
++	if creds.Security != nil {
++		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
++		if err == nil {
++			checkErr := vfs.CheckLandlockPath(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
++			parentVD.DecRef(ctx)
++			if checkErr != nil {
++				return checkErr
++			}
++		}
++	}
++
+ 	rp := vfs.getResolvingPath(creds, pop)
+ 	defer rp.Release(ctx)
+ 	for {
+diff --git a/test/syscalls/BUILD b/test/syscalls/BUILD
+index c7c362871..1089a1bee 100644
+--- a/test/syscalls/BUILD
++++ b/test/syscalls/BUILD
+@@ -358,6 +358,10 @@ syscall_test(
+     test = "//test/syscalls/linux:kill_test",
+ )
+ 
++syscall_test(
++    test = "//test/syscalls/linux:landlock_test",
++)
++
+ syscall_test(
+     add_fusefs = True,
+     add_overlay = True,
+diff --git a/test/syscalls/linux/BUILD b/test/syscalls/linux/BUILD
+index b5b6d0eee..df7dddc80 100644
+--- a/test/syscalls/linux/BUILD
++++ b/test/syscalls/linux/BUILD
+@@ -1314,6 +1314,22 @@ cc_binary(
+     ],
+ )
+ 
++cc_binary(
++    name = "landlock_test",
++    testonly = 1,
++    srcs = ["landlock.cc"],
++    linkstatic = 1,
++    malloc = "//test/util:errno_safe_allocator",
++    deps = select_gtest() + [
++        "//test/util:capability_util",
++        "//test/util:file_descriptor",
++        "//test/util:fs_util",
++        "//test/util:temp_path",
++        "//test/util:test_main",
++        "//test/util:test_util",
++    ],
++)
++
+ cc_binary(
+     name = "link_test",
+     testonly = 1,
+diff --git a/test/syscalls/linux/landlock.cc b/test/syscalls/linux/landlock.cc
+new file mode 100644
+index 000000000..ef4e5eb84
+--- /dev/null
++++ b/test/syscalls/linux/landlock.cc
+@@ -0,0 +1,650 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include <fcntl.h>
++#include <sys/prctl.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <functional>
++#include <string>
++
++#include "gtest/gtest.h"
++#include "test/util/capability_util.h"
++#include "test/util/file_descriptor.h"
++#include "test/util/fs_util.h"
++#include "test/util/temp_path.h"
++#include "test/util/test_util.h"
++
++// Define syscall numbers if not present
++#ifndef __NR_landlock_create_ruleset
++#define __NR_landlock_create_ruleset 444
++#endif
++#ifndef __NR_landlock_add_rule
++#define __NR_landlock_add_rule 445
++#endif
++#ifndef __NR_landlock_restrict_self
++#define __NR_landlock_restrict_self 446
++#endif
++
++// Landlock flags
++#ifndef LANDLOCK_CREATE_RULESET_VERSION
++#define LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
++#endif
++
++// Rule types
++#ifndef LANDLOCK_RULE_PATH_BENEATH
++#define LANDLOCK_RULE_PATH_BENEATH 1
++#endif
++
++// Access rights (v1)
++#define LANDLOCK_ACCESS_FS_EXECUTE (1ULL << 0)
++#define LANDLOCK_ACCESS_FS_WRITE_FILE (1ULL << 1)
++#define LANDLOCK_ACCESS_FS_READ_FILE (1ULL << 2)
++#define LANDLOCK_ACCESS_FS_READ_DIR (1ULL << 3)
++#define LANDLOCK_ACCESS_FS_REMOVE_DIR (1ULL << 4)
++#define LANDLOCK_ACCESS_FS_REMOVE_FILE (1ULL << 5)
++#define LANDLOCK_ACCESS_FS_MAKE_CHAR (1ULL << 6)
++#define LANDLOCK_ACCESS_FS_MAKE_DIR (1ULL << 7)
++#define LANDLOCK_ACCESS_FS_MAKE_REG (1ULL << 8)
++#define LANDLOCK_ACCESS_FS_MAKE_SOCK (1ULL << 9)
++#define LANDLOCK_ACCESS_FS_MAKE_FIFO (1ULL << 10)
++#define LANDLOCK_ACCESS_FS_MAKE_BLOCK (1ULL << 11)
++#define LANDLOCK_ACCESS_FS_MAKE_SYM (1ULL << 12)
++
++#define LANDLOCK_ACCESS_FS_ALL_V1                                      \
++  (LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE |        \
++   LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |        \
++   LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |    \
++   LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR |        \
++   LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |        \
++   LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |      \
++   LANDLOCK_ACCESS_FS_MAKE_SYM)
++
++// Structs
++struct landlock_ruleset_attr {
++  uint64_t handled_access_fs;
++};
++
++struct landlock_path_beneath_attr {
++  uint64_t allowed_access;
++  int32_t parent_fd;
++} __attribute__((packed));
++
++namespace gvisor {
++namespace testing {
++namespace {
++
++class LandlockTest : public ::testing::Test {
++ protected:
++  void SetUp() override {
++    // Check if Landlock is supported by the kernel
++    int version = syscall(__NR_landlock_create_ruleset, NULL, 0,
++                          LANDLOCK_CREATE_RULESET_VERSION);
++    if (version < 0) {
++      if (errno == ENOSYS || errno == EOPNOTSUPP) {
++        GTEST_SKIP() << "Landlock not supported by kernel";
++      }
++      FAIL() << "Failed to check Landlock version: " << strerror(errno);
++    }
++  }
++
++  void RunInFork(std::function<void()> const& f) {
++    pid_t pid = fork();
++    ASSERT_GE(pid, 0);
++    if (pid == 0) {
++      f();
++      if (::testing::Test::HasFailure()) {
++        _exit(1);
++      }
++      _exit(0);
++    }
++    int status;
++    ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceeds());
++    ASSERT_TRUE(WIFEXITED(status));
++    EXPECT_EQ(WEXITSTATUS(status), 0);
++  }
++};
++
++TEST_F(LandlockTest, VersionCheck) {
++  int version = syscall(__NR_landlock_create_ruleset, NULL, 0,
++                        LANDLOCK_CREATE_RULESET_VERSION);
++  ASSERT_GE(version, 1);
++}
++
++TEST_F(LandlockTest, CreateRulesetInvalidFlags) {
++  struct landlock_ruleset_attr attr = {0};
++  EXPECT_THAT(syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 1 << 30),
++              SyscallFailsWithErrno(EINVAL));
++}
++
++TEST_F(LandlockTest, CreateRulesetInvalidSize) {
++  struct landlock_ruleset_attr attr = {0};
++  EXPECT_THAT(syscall(__NR_landlock_create_ruleset, &attr, 7, 0),
++              SyscallFailsWithErrno(EINVAL));
++}
++
++TEST_F(LandlockTest, CreateRulesetBadPointer) {
++  EXPECT_THAT(syscall(__NR_landlock_create_ruleset, nullptr, 8, 0),
++              SyscallFailsWithErrno(EFAULT));
++  EXPECT_THAT(syscall(__NR_landlock_create_ruleset, (void*)-1, 8, 0),
++              SyscallFailsWithErrno(EFAULT));
++}
++
++TEST_F(LandlockTest, AddRuleInvalidFlags) {
++  struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++  struct landlock_path_beneath_attr path_attr = {
++    .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++    .parent_fd = AT_FDCWD,
++  };
++
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                      LANDLOCK_RULE_PATH_BENEATH, &path_attr, 1),
++              SyscallFailsWithErrno(EINVAL));
++}
++
++TEST_F(LandlockTest, AddRuleInvalidRulesetFd) {
++  struct landlock_path_beneath_attr path_attr = {
++    .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++    .parent_fd = AT_FDCWD,
++  };
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, -1, LANDLOCK_RULE_PATH_BENEATH,
++                      &path_attr, 0),
++              SyscallFailsWithErrno(EBADF));
++
++  int null_fd = open("/dev/null", O_RDONLY);
++  ASSERT_GE(null_fd, 0);
++  auto cleanup_null = FileDescriptor(null_fd);
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, null_fd,
++                      LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++              SyscallFailsWithErrno(EBADFD));
++}
++
++TEST_F(LandlockTest, AddRuleInvalidRuleType) {
++  struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++  struct landlock_path_beneath_attr path_attr = {
++    .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++    .parent_fd = AT_FDCWD,
++  };
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd, 0, &path_attr, 0),
++              SyscallFailsWithErrno(EINVAL));
++}
++
++TEST_F(LandlockTest, AddRuleInvalidAccess) {
++  struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++  struct landlock_path_beneath_attr path_attr = {
++    .allowed_access = LANDLOCK_ACCESS_FS_WRITE_FILE,
++    .parent_fd = AT_FDCWD,
++  };
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                      LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++              SyscallFailsWithErrno(EINVAL));
++}
++
++TEST_F(LandlockTest, AddRuleEmptyAccess) {
++  struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++  struct landlock_path_beneath_attr path_attr = {
++    .allowed_access = 0,
++    .parent_fd = AT_FDCWD,
++  };
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                      LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++              SyscallFailsWithErrno(ENOMSG));
++}
++
++TEST_F(LandlockTest, AddRuleInvalidParentFd) {
++  struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++  struct landlock_path_beneath_attr path_attr = {
++    .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++    .parent_fd = -1,
++  };
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                      LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++              SyscallFailsWithErrno(EBADF));
++
++  struct landlock_path_beneath_attr path_attr2 = {
++    .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++    .parent_fd = ruleset_fd,
++  };
++  EXPECT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                      LANDLOCK_RULE_PATH_BENEATH, &path_attr2, 0),
++              SyscallFailsWithErrno(EBADFD));
++}
++
++TEST_F(LandlockTest, RestrictSelfInvalidFlags) {
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++    EXPECT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 1U << 3),
++                SyscallFailsWithErrno(EINVAL));
++  });
++}
++
++TEST_F(LandlockTest, RestrictSelfInvalidRulesetFd) {
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    EXPECT_THAT(syscall(__NR_landlock_restrict_self, -1, 0),
++                SyscallFailsWithErrno(EBADF));
++
++    int null_fd = open("/dev/null", O_RDONLY);
++    ASSERT_GE(null_fd, 0);
++    auto cleanup_null = FileDescriptor(null_fd);
++    EXPECT_THAT(syscall(__NR_landlock_restrict_self, null_fd, 0),
++                SyscallFailsWithErrno(EBADFD));
++  });
++}
++
++TEST_F(LandlockTest, RestrictSelfRequiresNoNewPrivsOrSysAdmin) {
++  struct landlock_ruleset_attr attr = {LANDLOCK_ACCESS_FS_READ_FILE};
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_fd = FileDescriptor(ruleset_fd);
++
++  pid_t pid = fork();
++  ASSERT_GE(pid, 0);
++  if (pid == 0) {
++    auto cap_status = SetCapability(CAP_SYS_ADMIN, false);
++    if (!cap_status.ok()) {
++      fprintf(stderr, "Failed to drop CAP_SYS_ADMIN: %s\n", cap_status.message());
++      _exit(1);
++    }
++
++    long res = syscall(__NR_landlock_restrict_self, ruleset_fd, 0);
++    if (res != -1 || errno != EPERM) {
++      fprintf(stderr, "restrict_self succeeded or failed with wrong errno: %ld, %d\n", res, errno);
++      _exit(2);
++    }
++
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
++      fprintf(stderr, "prctl(PR_SET_NO_NEW_PRIVS) failed: %s\n", strerror(errno));
++      _exit(3);
++    }
++
++    res = syscall(__NR_landlock_restrict_self, ruleset_fd, 0);
++    if (res != 0) {
++      fprintf(stderr, "restrict_self failed after setting NNP: %ld, %d\n", res, errno);
++      _exit(4);
++    }
++
++    _exit(0);
++  }
++
++  int status;
++  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceeds());
++  ASSERT_TRUE(WIFEXITED(status));
++  EXPECT_EQ(WEXITSTATUS(status), 0);
++}
++
++TEST_F(LandlockTest, BasicPathRestrictions) {
++  std::string tmp_dir = NewTempAbsPath();
++  ASSERT_THAT(mkdir(tmp_dir.c_str(), 0777), SyscallSucceeds());
++  
++  std::string dir_allowed = JoinPath(tmp_dir, "allowed");
++  std::string dir_denied = JoinPath(tmp_dir, "denied");
++  ASSERT_THAT(mkdir(dir_allowed.c_str(), 0777), SyscallSucceeds());
++  ASSERT_THAT(mkdir(dir_denied.c_str(), 0777), SyscallSucceeds());
++
++  std::string file_allowed = JoinPath(dir_allowed, "file");
++  std::string file_denied = JoinPath(dir_denied, "file");
++  
++  int fd;
++  ASSERT_THAT(fd = open(file_allowed.c_str(), O_RDWR | O_CREAT, 0666), SyscallSucceeds());
++  close(fd);
++  ASSERT_THAT(fd = open(file_denied.c_str(), O_RDWR | O_CREAT, 0666), SyscallSucceeds());
++  close(fd);
++
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    int allowed_dfd = open(dir_allowed.c_str(), O_PATH | O_DIRECTORY);
++    ASSERT_GE(allowed_dfd, 0);
++    auto cleanup_allowed = FileDescriptor(allowed_dfd);
++
++    struct landlock_path_beneath_attr path_attr = {
++      .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++      .parent_fd = allowed_dfd,
++    };
++    ASSERT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                        LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++                SyscallSucceeds());
++
++    ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallSucceeds());
++
++    int rfd = open(file_allowed.c_str(), O_RDONLY);
++    EXPECT_GE(rfd, 0);
++    if (rfd >= 0) close(rfd);
++
++    EXPECT_THAT(open(file_allowed.c_str(), O_WRONLY),
++                SyscallFailsWithErrno(EACCES));
++
++    EXPECT_THAT(open(file_denied.c_str(), O_RDONLY),
++                SyscallFailsWithErrno(EACCES));
++
++    EXPECT_THAT(open(file_denied.c_str(), O_WRONLY),
++                SyscallFailsWithErrno(EACCES));
++  });
++
++  unlink(file_allowed.c_str());
++  unlink(file_denied.c_str());
++  rmdir(dir_allowed.c_str());
++  rmdir(dir_denied.c_str());
++  rmdir(tmp_dir.c_str());
++}
++
++TEST_F(LandlockTest, DirectoryOperations) {
++  std::string tmp_dir = NewTempAbsPath();
++  ASSERT_THAT(mkdir(tmp_dir.c_str(), 0777), SyscallSucceeds());
++
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallSucceeds());
++
++    std::string new_dir = JoinPath(tmp_dir, "new_dir");
++    EXPECT_THAT(mkdir(new_dir.c_str(), 0777), SyscallFailsWithErrno(EACCES));
++  });
++
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    int tmp_dfd = open(tmp_dir.c_str(), O_PATH | O_DIRECTORY);
++    ASSERT_GE(tmp_dfd, 0);
++    auto cleanup_tmp = FileDescriptor(tmp_dfd);
++
++    struct landlock_path_beneath_attr path_attr = {
++      .allowed_access = LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR,
++      .parent_fd = tmp_dfd,
++    };
++    ASSERT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                        LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++                SyscallSucceeds());
++
++    ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallSucceeds());
++
++    std::string new_dir = JoinPath(tmp_dir, "new_dir");
++    EXPECT_THAT(mkdir(new_dir.c_str(), 0777), SyscallSucceeds());
++    EXPECT_THAT(rmdir(new_dir.c_str()), SyscallSucceeds());
++  });
++
++  rmdir(tmp_dir.c_str());
++}
++
++TEST_F(LandlockTest, RuleInheritance) {
++  std::string tmp_dir = NewTempAbsPath();
++  ASSERT_THAT(mkdir(tmp_dir.c_str(), 0777), SyscallSucceeds());
++
++  std::string parent = JoinPath(tmp_dir, "parent");
++  std::string child = JoinPath(parent, "child");
++  std::string grandchild = JoinPath(child, "grandchild");
++  ASSERT_THAT(mkdir(parent.c_str(), 0777), SyscallSucceeds());
++  ASSERT_THAT(mkdir(child.c_str(), 0777), SyscallSucceeds());
++  ASSERT_THAT(mkdir(grandchild.c_str(), 0777), SyscallSucceeds());
++
++  std::string file = JoinPath(grandchild, "file");
++  int fd;
++  ASSERT_THAT(fd = open(file.c_str(), O_RDWR | O_CREAT, 0666), SyscallSucceeds());
++  close(fd);
++
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    int parent_dfd = open(parent.c_str(), O_PATH | O_DIRECTORY);
++    ASSERT_GE(parent_dfd, 0);
++    auto cleanup_parent = FileDescriptor(parent_dfd);
++
++    struct landlock_path_beneath_attr path_attr = {
++      .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
++      .parent_fd = parent_dfd,
++    };
++    ASSERT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                        LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0),
++                SyscallSucceeds());
++
++    ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallSucceeds());
++
++    int rfd = open(file.c_str(), O_RDONLY);
++    EXPECT_GE(rfd, 0);
++    if (rfd >= 0) close(rfd);
++  });
++
++  unlink(file.c_str());
++  rmdir(grandchild.c_str());
++  rmdir(child.c_str());
++  rmdir(parent.c_str());
++  rmdir(tmp_dir.c_str());
++}
++
++TEST_F(LandlockTest, StackingRulesetsLimit) {
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    for (int i = 0; i < 16; ++i) {
++      struct landlock_ruleset_attr attr = {
++        .handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE,
++      };
++      int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++      ASSERT_GE(ruleset_fd, 0) << "Failed to create ruleset at layer " << i;
++      auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++      ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                  SyscallSucceeds()) << "Failed to restrict self at layer " << i;
++    }
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    EXPECT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallFailsWithErrno(E2BIG));
++  });
++}
++
++TEST_F(LandlockTest, CrossDirectoryRenameLinkDenied) {
++  std::string tmp_dir = NewTempAbsPath();
++  ASSERT_THAT(mkdir(tmp_dir.c_str(), 0777), SyscallSucceeds());
++
++  std::string dir1 = JoinPath(tmp_dir, "dir1");
++  std::string dir2 = JoinPath(tmp_dir, "dir2");
++  ASSERT_THAT(mkdir(dir1.c_str(), 0777), SyscallSucceeds());
++  ASSERT_THAT(mkdir(dir2.c_str(), 0777), SyscallSucceeds());
++
++  std::string file1 = JoinPath(dir1, "file1");
++  int fd;
++  ASSERT_THAT(fd = open(file1.c_str(), O_RDWR | O_CREAT, 0666), SyscallSucceeds());
++  close(fd);
++
++  RunInFork([&]() {
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    uint64_t access_mask =
++        LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_REMOVE_FILE |
++        LANDLOCK_ACCESS_FS_MAKE_REG;
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = access_mask,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    int dir1_fd = open(dir1.c_str(), O_PATH | O_DIRECTORY);
++    ASSERT_GE(dir1_fd, 0);
++    auto cleanup_dir1 = FileDescriptor(dir1_fd);
++
++    int dir2_fd = open(dir2.c_str(), O_PATH | O_DIRECTORY);
++    ASSERT_GE(dir2_fd, 0);
++    auto cleanup_dir2 = FileDescriptor(dir2_fd);
++
++    struct landlock_path_beneath_attr path_attr1 = {
++      .allowed_access = access_mask,
++      .parent_fd = dir1_fd,
++    };
++    ASSERT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                        LANDLOCK_RULE_PATH_BENEATH, &path_attr1, 0),
++                SyscallSucceeds());
++
++    struct landlock_path_beneath_attr path_attr2 = {
++      .allowed_access = access_mask,
++      .parent_fd = dir2_fd,
++    };
++    ASSERT_THAT(syscall(__NR_landlock_add_rule, ruleset_fd,
++                        LANDLOCK_RULE_PATH_BENEATH, &path_attr2, 0),
++                SyscallSucceeds());
++
++    ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallSucceeds());
++
++    std::string file1_renamed = JoinPath(dir1, "file1_renamed");
++    EXPECT_THAT(rename(file1.c_str(), file1_renamed.c_str()), SyscallSucceeds());
++    EXPECT_THAT(rename(file1_renamed.c_str(), file1.c_str()), SyscallSucceeds());
++
++    std::string file1_link = JoinPath(dir1, "file1_link");
++    EXPECT_THAT(link(file1.c_str(), file1_link.c_str()), SyscallSucceeds());
++    EXPECT_THAT(unlink(file1_link.c_str()), SyscallSucceeds());
++
++    std::string file2 = JoinPath(dir2, "file2");
++    EXPECT_THAT(rename(file1.c_str(), file2.c_str()), SyscallFailsWithErrno(EXDEV));
++
++    EXPECT_THAT(link(file1.c_str(), file2.c_str()), SyscallFailsWithErrno(EXDEV));
++  });
++
++  unlink(file1.c_str());
++  rmdir(dir1.c_str());
++  rmdir(dir2.c_str());
++  rmdir(tmp_dir.c_str());
++}
++
++TEST_F(LandlockTest, NoRestrictionByDefault) {
++  std::string tmp_dir = NewTempAbsPath();
++  ASSERT_THAT(mkdir(tmp_dir.c_str(), 0777), SyscallSucceeds());
++  std::string file = JoinPath(tmp_dir, "file");
++
++  struct landlock_ruleset_attr attr = {
++    .handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE,
++  };
++  int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++  ASSERT_GE(ruleset_fd, 0);
++  auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++  int fd = open(file.c_str(), O_RDWR | O_CREAT, 0666);
++  EXPECT_GE(fd, 0);
++  if (fd >= 0) {
++    EXPECT_THAT(write(fd, "test", 4), SyscallSucceedsWithValue(4));
++    close(fd);
++  }
++
++  int rfd = open(file.c_str(), O_RDONLY);
++  EXPECT_GE(rfd, 0);
++  if (rfd >= 0) close(rfd);
++
++  unlink(file.c_str());
++  rmdir(tmp_dir.c_str());
++}
++
++TEST_F(LandlockTest, RestrictSelfDoesNotAffectOtherState) {
++  RunInFork([&]() {
++    uid_t uid = getuid();
++    gid_t gid = getgid();
++
++    int null_fd = open("/dev/null", O_RDONLY);
++    ASSERT_GE(null_fd, 0);
++    auto cleanup_null = FileDescriptor(null_fd);
++
++    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
++
++    struct landlock_ruleset_attr attr = {
++      .handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE,
++    };
++    int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
++    ASSERT_GE(ruleset_fd, 0);
++    auto cleanup_ruleset = FileDescriptor(ruleset_fd);
++
++    ASSERT_THAT(syscall(__NR_landlock_restrict_self, ruleset_fd, 0),
++                SyscallSucceeds());
++
++    EXPECT_EQ(getuid(), uid);
++    EXPECT_EQ(getgid(), gid);
++
++    char buf[10];
++    EXPECT_THAT(read(null_fd, buf, sizeof(buf)), SyscallSucceedsWithValue(0));
++  });
++}
++
++}  // namespace
++}  // namespace testing
++}  // namespace gvisor
