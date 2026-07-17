@@ -990,6 +990,13 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	}
 	// Create the file on the upper layer, and get an FD representing it.
 	createCreds := parent.credsForCreate(creds, parent.isSGIDSet())
+	// Check Landlock permissions before creating the file on the upper layer.
+	// Matches Linux security/landlock/fs.c:hook_file_open() semantics but performed
+	// pre-creation to avoid TOCTOU.
+	if err := rp.CheckCreateAccess(ctx, &parent.vfsd, opts.Mode); err != nil {
+		return nil, err
+	}
+
 	upperFD, err := vfsObj.OpenAt(ctx, createCreds, &pop, &vfs.OpenOptions{
 		Flags: opts.Flags&^vfs.FileCreationFlags | linux.O_CREAT | linux.O_EXCL,
 		Mode:  opts.Mode,

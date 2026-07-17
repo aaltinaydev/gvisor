@@ -315,7 +315,11 @@ func (c *cgroupInode) CgroupFromControlFileFD(fd *vfs.FileDescription) kernel.Cg
 	// cgroupfs, the parent directory relationship of a control file is
 	// effectively immutable. Control files cannot be unlinked, renamed or
 	// destroyed independently from their parent directory.
-	parentD := controlFileDentry.Parent()
+	parentVFSD := controlFileDentry.Parent()
+	var parentD *kernfs.Dentry
+	if parentVFSD != nil {
+		parentD = parentVFSD.Impl().(*kernfs.Dentry)
+	}
 	return kernel.Cgroup{
 		Dentry:     parentD,
 		CgroupImpl: c,

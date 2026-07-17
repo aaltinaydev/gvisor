@@ -219,6 +219,13 @@ func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskI
 	cu.Add(func() {
 		t.releaseExecveCredsLocks()
 	})
+	if newCreds.LandlockDomain != nil {
+		// Register a cleanup task to release the Landlock domain reference
+		// if the execve fails after this point.
+		cu.Add(func() {
+			newCreds.LandlockDomain.DecRef(t)
+		})
+	}
 	defer cu.Clean()
 	// We can't clearly hold kernel package locks while stat'ing executable.
 	if seccheck.Global.Enabled(seccheck.PointExecve) {
@@ -281,6 +288,11 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	if t.killed() {
 		t.tg.pidns.owner.mu.Unlock()
 		r.image.release(t)
+		if r.newCreds.LandlockDomain != nil {
+			// DecRef is necessary to prevent leaking the Landlock domain reference
+			// if the task was killed and we abort the execve.
+			r.newCreds.LandlockDomain.DecRef(t)
+		}
 		return (*runInterrupt)(nil)
 	}
 	// We are the thread group leader now. Save our old thread ID for
@@ -385,7 +397,7 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	t.p.PrepareExecve()
 	// Update credentials to reflect the execve. This should precede switching
 	// MMs to ensure that dumpability has been reset first, if needed.
-	t.creds.Store(r.newCreds)
+	t.updateCredentials(r.newCreds)
 	t.mu.Lock()
 	oldImage := t.image
 	t.image = *r.image

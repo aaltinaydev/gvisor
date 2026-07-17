@@ -62,7 +62,7 @@ func (fs *Filesystem) stepExistingLocked(ctx context.Context, rp *vfs.ResolvingP
 			rp.Advance()
 			return d, false, nil
 		}
-		if err := rp.CheckMount(ctx, d.Parent().VFSDentry()); err != nil {
+		if err := rp.CheckMount(ctx, d.Parent()); err != nil {
 			return nil, false, err
 		}
 		rp.Advance()

@@ -259,6 +259,14 @@ type Dentry struct {
 	deleted atomicbitops.Uint32
 }
 
+// Parent implements vfs.DentryImpl.Parent.
+func (d *Dentry) Parent() *vfs.Dentry {
+	if p := d.parent.Load(); p != nil {
+		return &p.vfsd
+	}
+	return nil
+}
+
 // IncRef implements vfs.DentryImpl.IncRef.
 func (d *Dentry) IncRef() {
 	// d.refs may be 0 if d.fs.mu is locked, which serializes against
@@ -691,12 +699,6 @@ func (d *Dentry) WalkDentryTree(ctx context.Context, vfsObj *vfs.VirtualFilesyst
 	return target, nil
 }
 
-// Parent returns the parent of this Dentry. This is not safe in general, the
-// filesystem may concurrently move d elsewhere. The caller is responsible for
-// ensuring the returned result remains valid while it is used.
-func (d *Dentry) Parent() *Dentry {
-	return d.parent.Load()
-}
 
 // The Inode interface maps filesystem-level operations that operate on paths to
 // equivalent operations on specific filesystem nodes.

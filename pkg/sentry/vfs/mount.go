@@ -202,7 +202,7 @@ func (mnt *Mount) isFollower() bool {
 	return mnt.leader != nil
 }
 
-func (mnt *Mount) neverConnected() bool {
+func (mnt *Mount) NeverConnected() bool {
 	return mnt.ns == nil
 }
 
@@ -293,7 +293,7 @@ func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, 
 	defer cleanup.Clean()
 	// This is equivalent to checking for SB_NOUSER in Linux, which is set on all
 	// anon mounts and sentry-internal filesystems like pipefs.
-	if mp.mount.neverConnected() {
+	if mp.mount.NeverConnected() {
 		return linuxerr.EINVAL
 	}
 	defer func() { mp.mount.ns.pending = 0 }()
@@ -312,7 +312,7 @@ func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, 
 		propMnts, err = vfs.doPropagation(ctx, mnt, mp)
 		if err != nil {
 			for pmnt := range propMnts {
-				if !pmnt.parent().neverConnected() {
+				if !pmnt.parent().NeverConnected() {
 					pmnt.parent().ns.pending -= pmnt.countSubmountsLocked()
 				}
 				vfs.abortUncommitedMount(ctx, pmnt)
@@ -406,7 +406,7 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 	if err != nil {
 		return err
 	}
-	if mp.mount.neverConnected() || mp.mount.umounted {
+	if mp.mount.NeverConnected() || mp.mount.umounted {
 		mp.dentry.mu.Unlock()
 		vfs.delayDecRef(mp)
 		return linuxerr.EINVAL

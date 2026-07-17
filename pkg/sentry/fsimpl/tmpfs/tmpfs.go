@@ -564,6 +564,14 @@ func (fs *filesystem) newDentry(inode *inode) *dentry {
 	return d
 }
 
+// Parent implements vfs.DentryImpl.Parent.
+func (d *dentry) Parent() *vfs.Dentry {
+	if p := d.parent.Load(); p != nil {
+		return &p.vfsd
+	}
+	return nil
+}
+
 // IncRef implements vfs.DentryImpl.IncRef.
 func (d *dentry) IncRef() {
 	d.inode.incRef()

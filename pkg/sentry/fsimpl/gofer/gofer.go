@@ -1559,6 +1559,14 @@ func dentryGID(gid lisafs.GID) uint32 {
 	return uint32(gid)
 }
 
+// Parent implements vfs.DentryImpl.Parent.
+func (d *dentry) Parent() *vfs.Dentry {
+	if p := d.parent.Load(); p != nil {
+		return &p.vfsd
+	}
+	return nil
+}
+
 // IncRef implements vfs.DentryImpl.IncRef.
 func (d *dentry) IncRef() {
 	// d.refs may be 0 if d.inode.fs.renameMu is locked, which serializes against

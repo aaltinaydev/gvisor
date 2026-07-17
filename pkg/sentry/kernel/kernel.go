@@ -1375,6 +1375,13 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if se != nil {
 		return nil, 0, errors.New(se.String())
 	}
+	if newCreds.LandlockDomain != nil {
+		// Register a cleanup task to release the Landlock domain reference
+		// if process creation fails.
+		cu.Add(func() {
+			newCreds.LandlockDomain.DecRef(ctx)
+		})
+	}
 	args.FDTable.IncRef()
 
 	// Create the task.

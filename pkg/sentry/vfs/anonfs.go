@@ -321,6 +321,12 @@ func (d *anonDentry) DecRef(ctx context.Context) {
 	// no-op
 }
 
+// Parent implements DentryImpl.Parent.
+func (d *anonDentry) Parent() *Dentry {
+	return nil
+}
+
+
 // InotifyWithParent implements DentryImpl.InotifyWithParent.
 func (d *anonDentry) InotifyWithParent(ctx context.Context, events, cookie uint32, et EventType) {
 	// d.parent doesn't exist.

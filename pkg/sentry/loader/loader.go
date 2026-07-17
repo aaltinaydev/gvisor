@@ -320,7 +320,7 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to read file privileges of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
+	c, secureExec, err := auth.ComputeCredsForExec(ctx, auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
 		args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to update creds with file privileges: %v", err), syserr.FromError(err).ToLinux())
@@ -348,6 +348,11 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 
 	sl, err := stack.Load(newArgv, args.Envv, auxv)
 	if err != nil {
+		if c.LandlockDomain != nil {
+			// DecRef is necessary to prevent leaking the Landlock domain reference
+			// if stack loading fails during image loading.
+			c.LandlockDomain.DecRef(ctx)
+		}
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
 	}
 

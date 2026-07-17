@@ -1300,6 +1300,13 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		kgid = auth.KGID(d.inode.gid.Load())
 	}
 
+	// Check Landlock permissions before creating the file on the host.
+	// Matches Linux security/landlock/fs.c:hook_file_open() semantics but performed
+	// pre-creation to avoid TOCTOU.
+	if err := rp.CheckCreateAccess(ctx, &d.vfsd, opts.Mode); err != nil {
+		return nil, err
+	}
+
 	child, h, err := d.openCreate(ctx, name, opts.Flags&linux.O_ACCMODE, opts.Mode, creds.EffectiveKUID, kgid, true /* createDentry */)
 	if err != nil {
 		return nil, err

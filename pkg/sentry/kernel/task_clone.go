@@ -296,6 +296,12 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	childCreds := creds
 	if userns != creds.UserNamespace {
 		childCreds = creds.ForkIntoUserNamespace(userns)
+	} else if creds.LandlockDomain != nil {
+		// Matches Linux security/landlock/cred.c:hook_cred_prepare()
+		// Fork credentials to clone the LandlockDomain (incrementing its ref count).
+		// Landlock domains are task-private and must be cloned for new tasks
+		// to ensure correct reference lifecycle tracking.
+		childCreds = creds.Fork()
 	}
 
 	cfg := &TaskConfig{
@@ -738,6 +744,16 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		checkCreds = creds.ForkIntoUserNamespace(nss.userNS)
 	}
 
+	checkCredsOK := false
+	defer func() {
+		// Matches Linux security/landlock/cred.c:hook_cred_free()
+		// If Setns fails after creating new credentials, we must release the reference
+		// to the cloned Landlock domain.
+		if !checkCredsOK && checkCreds != creds && checkCreds.LandlockDomain != nil {
+			checkCreds.LandlockDomain.DecRef(t)
+		}
+	}()
+
 	if nss.childPIDNS != nil {
 		if !checkCreds.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.childPIDNS.UserNamespace()) || !checkCreds.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
@@ -795,7 +811,7 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 	// Store replaced resources in nss so that they're cleaned up by the deferred function.
 	t.mu.Lock()
 	if nss.userNS != nil {
-		t.creds.Store(checkCreds)
+		t.updateCredentials(checkCreds)
 		nss.userNS = creds.UserNamespace
 	}
 	if nss.childPIDNS != nil {
@@ -817,6 +833,7 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		nss.fsContext = tmp
 	}
 	t.mu.Unlock()
+	checkCredsOK = true
 	return nil
 }
 
@@ -873,7 +890,14 @@ func (t *Task) Unshare(flags int32) error {
 		newIPCNS      *IPCNamespace
 		newMountNS    *vfs.MountNamespace
 	)
+	unshareOK := false
 	defer func() {
+		// Matches Linux security/landlock/cred.c:hook_cred_free()
+		// If Unshare fails after creating new credentials, we must release the reference
+		// to the cloned Landlock domain.
+		if !unshareOK && newCreds && creds.LandlockDomain != nil {
+			creds.LandlockDomain.DecRef(t)
+		}
 		if newFSContext != nil {
 			newFSContext.destroy(t)
 		}
@@ -950,10 +974,11 @@ func (t *Task) Unshare(flags int32) error {
 
 	// Switch to new execution context. Store replaced resources in new* so
 	// that they're cleaned up by the deferred function.
+	unshareOK = true
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if newCreds {
-		t.creds.Store(creds)
+		t.updateCredentials(creds)
 		newUserNS = originalUserNS
 	}
 	if newFSContext != nil {

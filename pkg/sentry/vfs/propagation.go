@@ -40,7 +40,7 @@ const (
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) commitChildren(ctx context.Context, mnt *Mount) {
 	for c := range mnt.children {
-		if c.neverConnected() {
+		if c.NeverConnected() {
 			vfs.commitMount(ctx, c)
 		}
 	}
@@ -80,7 +80,7 @@ func (vfs *VirtualFilesystem) commitMount(ctx context.Context, mnt *Mount) {
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) abortUncomittedChildren(ctx context.Context, mnt *Mount) {
 	for c := range mnt.children {
-		if c.neverConnected() {
+		if c.NeverConnected() {
 			vfs.abortUncommitedMount(ctx, c)
 			delete(mnt.children, c)
 		}
@@ -266,7 +266,7 @@ func (vfs *VirtualFilesystem) peers(m1, m2 *Mount) bool {
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) propagateMount(ctx context.Context, dstMnt *Mount, dstPoint *Dentry, state *propState) error {
 	// Skip newly added mounts.
-	if dstMnt.neverConnected() || dstMnt.umounted {
+	if dstMnt.NeverConnected() || dstMnt.umounted {
 		return nil
 	}
 	// Skip anonymous ns mounts.
@@ -347,7 +347,7 @@ func nextFollowerPeerGroup(mnt *Mount, start *Mount) *Mount {
 		// After that the loop moves across peers (if possible) to the last peer
 		// in the group.
 		for {
-			if !mnt.neverConnected() && !mnt.followerList.Empty() {
+			if !mnt.NeverConnected() && !mnt.followerList.Empty() {
 				return mnt.followerList.Front()
 			}
 			next := mnt.sharedEntry.Next()
@@ -394,7 +394,7 @@ func nextFollowerPeerGroup(mnt *Mount, start *Mount) *Mount {
 // in Linux.
 func nextPropMount(mnt, start *Mount) *Mount {
 	m := mnt
-	if !m.neverConnected() && !m.followerList.Empty() {
+	if !m.NeverConnected() && !m.followerList.Empty() {
 		return m.followerList.Front()
 	}
 	for {

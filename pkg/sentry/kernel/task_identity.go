@@ -222,7 +222,7 @@ func (t *Task) setKUIDsUnchecked(newR, newE, newS auth.KUID) {
 		// Not documented, but compare Linux's kernel/cred.c:commit_creds().
 		t.parentDeathSignal = 0
 	}
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 }
 
 // SetGID implements the semantics of setgid(2).
@@ -336,7 +336,7 @@ func (t *Task) setKGIDsUnchecked(newR, newE, newS auth.KGID) {
 		// kernel/cred.c:commit_creds().
 		t.parentDeathSignal = 0
 	}
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 }
 
 // SetExtraGIDs attempts to change t's supplemental groups. All IDs are
@@ -360,7 +360,7 @@ func (t *Task) SetExtraGIDs(gids []auth.GID) error {
 	}
 	creds = creds.Fork() // The credentials object is immutable. See doc for creds.
 	creds.ExtraKGIDs = kgids
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 	return nil
 }
 
@@ -407,7 +407,7 @@ func (t *Task) SetCapabilitySets(permitted, inheritable, effective auth.Capabili
 	creds.InheritableCaps = inheritable
 	creds.EffectiveCaps = effective
 	creds.AmbientCaps &= permitted & inheritable
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 	return nil
 }
 
@@ -422,7 +422,7 @@ func (t *Task) DropBoundingCapability(cp linux.Capability) error {
 	}
 	creds = creds.Fork() // The credentials object is immutable. See doc for creds.
 	creds.BoundingCaps &^= auth.CapabilitySetOf(cp)
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 	return nil
 }
 
@@ -434,7 +434,7 @@ func (t *Task) SetKeepCaps(k bool) {
 	defer t.mu.Unlock()
 	creds := t.Credentials().Fork() // The credentials object is immutable. See doc for creds.
 	creds.KeepCaps = k
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 }
 
 // PrivilegedSecureBits is the set of securebits that are privileged.
@@ -509,7 +509,7 @@ func (t *Task) RaiseAmbientCapability(cp linux.Capability) error {
 	}
 	creds = creds.Fork()
 	creds.AmbientCaps |= cs
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 	return nil
 }
 
@@ -520,7 +520,7 @@ func (t *Task) LowerAmbientCapability(cp linux.Capability) error {
 	}
 	creds := t.Credentials().Fork()
 	creds.AmbientCaps &^= auth.CapabilitySetOf(cp)
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
 	return nil
 }
 
@@ -528,5 +528,39 @@ func (t *Task) LowerAmbientCapability(cp linux.Capability) error {
 func (t *Task) ClearAmbientCapabilities() {
 	creds := t.Credentials().Fork()
 	creds.AmbientCaps = 0
-	t.creds.Store(creds)
+	t.updateCredentials(creds)
+}
+
+// SetLandlockDomain sets the Landlock domain for the task.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) SetLandlockDomain(dom auth.LandlockDomain) {
+	creds := t.Credentials().Fork()
+	if creds.LandlockDomain != nil {
+		creds.LandlockDomain.DecRef(t)
+	}
+	creds.LandlockDomain = dom
+	t.updateCredentials(creds)
+}
+
+// updateCredentials updates t's credentials to newCreds and releases the
+// reference to the old credentials' Landlock domain.
+func (t *Task) updateCredentials(newCreds *auth.Credentials) {
+	oldCreds := t.Credentials()
+	t.creds.Store(newCreds)
+	if oldCreds != nil && oldCreds.LandlockDomain != nil {
+		oldCreds.LandlockDomain.DecRef(t)
+	}
+}
+
+// ClearLandlockDomain clears the Landlock domain for the task.
+func (t *Task) ClearLandlockDomain() {
+	oldCreds := t.Credentials()
+	if oldCreds.LandlockDomain == nil {
+		return
+	}
+	creds := new(auth.Credentials)
+	*creds = *oldCreds
+	creds.LandlockDomain = nil
+	t.updateCredentials(creds)
 }

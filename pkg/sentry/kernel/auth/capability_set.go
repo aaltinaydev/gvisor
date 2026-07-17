@@ -17,6 +17,7 @@ package auth
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 )
@@ -228,7 +229,7 @@ func handlePrivilegedRoot(c *Credentials, f *FilePrivileges, filename string) {
 //     allowSUID at most prevents further ID gain due the SUID/GID bits.
 //
 // Note that gVisor does not support Ambient capabilities.
-func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
+func ComputeCredsForExec(ctx context.Context, c *Credentials, f FilePrivileges, filename string,
 	noNewPrivs bool, stopPrivGain bool, allowSUID bool) (*Credentials, bool, error) {
 	if noNewPrivs || !allowSUID {
 		f.SetUserID = NoID
@@ -283,6 +284,11 @@ func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 		// ...If the process did not obtain the full set of file permitted capabilities,
 		// then execve(2) fails with the error EPERM."
 		if f.Effective && (newC.PermittedCaps&f.PermittedCaps != f.PermittedCaps) {
+			if newC.LandlockDomain != nil {
+				// DecRef is necessary to prevent leaking the Landlock domain reference
+				// if the execve fails with EPERM.
+				newC.LandlockDomain.DecRef(ctx)
+			}
 			return nil, false, linuxerr.EPERM
 		}
 	}

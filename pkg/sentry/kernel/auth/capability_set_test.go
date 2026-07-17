@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
 
@@ -171,7 +172,7 @@ func TestComputeCredsForExec(t *testing.T) {
 		},
 	} {
 		t.Run(tst.name, func(t *testing.T) {
-			newC, _, err := ComputeCredsForExec(tst.creds, tst.filePrivs, "", tst.noNewPrivs, tst.stopPrivGain, tst.allowSUID)
+			newC, _, err := ComputeCredsForExec(context.Background(), tst.creds, tst.filePrivs, "", tst.noNewPrivs, tst.stopPrivGain, tst.allowSUID)
 			if err == nil {
 				if tst.wantErr != nil {
 					t.Errorf("ComputeCredsForExec(%v) returned unexpected error %v", tst.filePrivs, tst.wantErr)

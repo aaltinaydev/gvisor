@@ -426,6 +426,13 @@ afterTrailingSymlink:
 		defer rp.Mount().EndWrite()
 		// Create and open the child.
 		creds := rp.Credentials()
+		// Check Landlock permissions before creating the file in memory.
+		// Matches Linux security/landlock/fs.c:hook_file_open() semantics but performed
+		// pre-creation to avoid TOCTOU.
+		if err := rp.CheckCreateAccess(ctx, &parentDir.dentry.vfsd, opts.Mode); err != nil {
+			return nil, err
+		}
+
 		childInode, err := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		if err != nil {
 			return nil, err

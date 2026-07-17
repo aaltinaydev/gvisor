@@ -670,6 +670,14 @@ func (fs *filesystem) newDentry() *dentry {
 	return d
 }
 
+// Parent implements vfs.DentryImpl.Parent.
+func (d *dentry) Parent() *vfs.Dentry {
+	if p := d.parent.Load(); p != nil {
+		return &p.vfsd
+	}
+	return nil
+}
+
 // IncRef implements vfs.DentryImpl.IncRef.
 func (d *dentry) IncRef() {
 	// d.refs may be 0 if d.fs.renameMu is locked, which serializes against

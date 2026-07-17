@@ -416,6 +416,14 @@ func (fs *filesystem) newDentry(nid uint64) (*dentry, error) {
 	return d, nil
 }
 
+// Parent implements vfs.DentryImpl.Parent.
+func (d *dentry) Parent() *vfs.Dentry {
+	if p := d.parent.Load(); p != nil {
+		return &p.vfsd
+	}
+	return nil
+}
+
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
 	d.dentryRefs.DecRef(func() {

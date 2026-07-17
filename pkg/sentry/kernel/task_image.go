@@ -158,6 +158,11 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 	if !ok {
 		// No syscall table found. This means that the ELF binary does not match
 		// the architecture.
+		if creds.LandlockDomain != nil {
+			// DecRef is necessary to prevent leaking the Landlock domain reference
+			// if we fail to lookup the syscall table for the new image.
+			creds.LandlockDomain.DecRef(ctx)
+		}
 		return nil, nil, false, errNoSyscalls
 	}
 

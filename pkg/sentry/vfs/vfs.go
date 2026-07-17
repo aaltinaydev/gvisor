@@ -306,6 +306,41 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 		return err
 	}
 
+	dom := creds.LandlockDomain
+	if dom != nil {
+		destParentVD, _, err := vfs.getParentDirAndName(ctx, creds, newpop)
+		if err != nil {
+			oldVD.DecRef(ctx)
+			return err
+		}
+		sourceParent := oldVD.dentry.Parent()
+		sameDir := (oldVD.mount == destParentVD.mount) && (sourceParent == destParentVD.dentry)
+
+		stat, err := vfs.StatAt(ctx, creds, &PathOperation{
+			Start: oldVD,
+			Path:  fspath.Path{},
+		}, &StatOptions{Mask: linux.STATX_TYPE})
+		if err != nil {
+			destParentVD.DecRef(ctx)
+			oldVD.DecRef(ctx)
+			return err
+		}
+
+		makeAccess := getModeAccess(linux.FileMode(stat.Mode))
+		allowed := vfs.checkLandlockAccess(ctx, creds, destParentVD, makeAccess)
+		destParentVD.DecRef(ctx)
+		if !allowed {
+			oldVD.DecRef(ctx)
+			return linuxerr.EACCES
+		}
+
+		if !sameDir {
+			oldVD.DecRef(ctx)
+			// Matches Linux security/landlock/fs.c:current_check_refer_path()
+			return linuxerr.EXDEV
+		}
+	}
+
 	if !newpop.Path.Begin.Ok() {
 		oldVD.DecRef(ctx)
 		if newpop.Path.Absolute {
@@ -360,6 +395,16 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 	// also honored." - mkdir(2)
 	opts.Mode &= 0777 | linux.S_ISVTX
 
+	parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+	if err != nil {
+		return err
+	}
+	allowed := vfs.checkLandlockAccess(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_DIR)
+	parentVD.DecRef(ctx)
+	if !allowed {
+		return linuxerr.EACCES
+	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
@@ -395,6 +440,16 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 	if pop.FollowFinalSymlink {
 		ctx.Warningf("VirtualFilesystem.MknodAt: file creation paths can't follow final symlink")
 		return linuxerr.EINVAL
+	}
+
+	parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+	if err != nil {
+		return err
+	}
+	allowed := vfs.checkLandlockAccess(ctx, creds, parentVD, getModeAccess(opts.Mode))
+	parentVD.DecRef(ctx)
+	if !allowed {
+		return linuxerr.EACCES
 	}
 
 	rp := vfs.getResolvingPath(creds, pop)
@@ -473,6 +528,10 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 		}
 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)
 		if err == nil {
+			if err := vfs.checkLandlockOpen(ctx, creds, fd, opts); err != nil {
+				fd.DecRef(ctx)
+				return nil, err
+			}
 			if opts.FileExec {
 				if fd.Mount().Options().Flags.NoExec {
 					fd.DecRef(ctx)
@@ -548,6 +607,126 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 		return linuxerr.EBUSY
 	}
 
+	dom := creds.LandlockDomain
+	if dom != nil {
+		newParentVD, _, err := vfs.getParentDirAndName(ctx, creds, newpop)
+		if err != nil {
+			oldParentVD.DecRef(ctx)
+			return err
+		}
+		sameDir := (oldParentVD.mount == newParentVD.mount) && (oldParentVD.dentry == newParentVD.dentry)
+
+		oldVD, err := vfs.GetDentryAt(ctx, creds, oldpop, &GetDentryOptions{})
+		if err != nil {
+			newParentVD.DecRef(ctx)
+			oldParentVD.DecRef(ctx)
+			return err
+		}
+
+		stat, err := vfs.StatAt(ctx, creds, &PathOperation{
+			Start: oldVD,
+			Path:  fspath.Path{},
+		}, &StatOptions{Mask: linux.STATX_TYPE})
+		if err != nil {
+			oldVD.DecRef(ctx)
+			newParentVD.DecRef(ctx)
+			oldParentVD.DecRef(ctx)
+			return err
+		}
+		// Matches Linux security/landlock/fs.c:current_check_refer_path() access mask setup.
+		isDir := (stat.Mode & linux.S_IFMT) == linux.S_IFDIR
+
+		var sourceRemoveAccess uint64
+		if isDir {
+			sourceRemoveAccess = linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+		} else {
+			sourceRemoveAccess = linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
+		}
+		sourceMakeAccess := getModeAccess(linux.FileMode(stat.Mode))
+
+		// Check if destination exists.
+		var destExists bool
+		var destIsDir bool
+		var destRemoveAccess uint64
+		var destMakeAccess uint64
+
+		destVD, err := vfs.GetDentryAt(ctx, creds, newpop, &GetDentryOptions{})
+		if err == nil {
+			destExists = true
+			destStat, err := vfs.StatAt(ctx, creds, &PathOperation{
+				Start: destVD,
+				Path:  fspath.Path{},
+			}, &StatOptions{Mask: linux.STATX_TYPE})
+			destVD.DecRef(ctx)
+			if err != nil {
+				oldVD.DecRef(ctx)
+				newParentVD.DecRef(ctx)
+				oldParentVD.DecRef(ctx)
+				return err
+			}
+			destIsDir = (destStat.Mode & linux.S_IFMT) == linux.S_IFDIR
+			if destIsDir {
+				destRemoveAccess = linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+			} else {
+				destRemoveAccess = linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
+			}
+			destMakeAccess = getModeAccess(linux.FileMode(destStat.Mode))
+		} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+			oldVD.DecRef(ctx)
+			newParentVD.DecRef(ctx)
+			oldParentVD.DecRef(ctx)
+			return err
+		}
+		oldVD.DecRef(ctx)
+
+		exchange := (opts.Flags & linux.RENAME_EXCHANGE) != 0
+		if exchange && !destExists {
+			newParentVD.DecRef(ctx)
+			oldParentVD.DecRef(ctx)
+			return linuxerr.ENOENT
+		}
+
+		if sameDir {
+			// Matches Linux security/landlock/fs.c:current_check_refer_path() same-directory check.
+			newParentVD.DecRef(ctx)
+
+			accessRequest := sourceRemoveAccess | sourceMakeAccess
+			if destExists {
+				accessRequest |= destRemoveAccess
+				if exchange {
+					accessRequest |= destMakeAccess
+				}
+			}
+			if !vfs.checkLandlockAccess(ctx, creds, oldParentVD, accessRequest) {
+				oldParentVD.DecRef(ctx)
+				return linuxerr.EACCES
+			}
+		} else {
+			// Cross-directory rename.
+			parent1Access := sourceRemoveAccess
+			if exchange && destExists {
+				parent1Access |= destMakeAccess
+			}
+
+			parent2Access := sourceMakeAccess
+			if destExists {
+				parent2Access |= destRemoveAccess
+			}
+
+			parent1Allowed := vfs.checkLandlockAccess(ctx, creds, oldParentVD, parent1Access)
+			parent2Allowed := vfs.checkLandlockAccess(ctx, creds, newParentVD, parent2Access)
+
+			newParentVD.DecRef(ctx)
+			oldParentVD.DecRef(ctx)
+
+			if !parent1Allowed || !parent2Allowed {
+				return linuxerr.EACCES
+			}
+			// Matches Linux security/landlock/fs.c:current_check_refer_path()
+			return linuxerr.EXDEV
+		}
+	}
+
 	if !newpop.Path.Begin.Ok() {
 		oldParentVD.DecRef(ctx)
 		if newpop.Path.Absolute {
@@ -601,6 +780,17 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
 	if pop.FollowFinalSymlink {
 		ctx.Warningf("VirtualFilesystem.RmdirAt: file deletion paths can't follow final symlink")
 		return linuxerr.EINVAL
+	}
+
+	// Matches Linux security/landlock/fs.c:hook_path_rmdir()
+	parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+	if err != nil {
+		return err
+	}
+	allowed := vfs.checkLandlockAccess(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR)
+	parentVD.DecRef(ctx)
+	if !allowed {
+		return linuxerr.EACCES
 	}
 
 	rp := vfs.getResolvingPath(creds, pop)
@@ -699,6 +889,17 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 		return linuxerr.EINVAL
 	}
 
+	// Matches Linux security/landlock/fs.c:hook_path_symlink()
+	parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+	if err != nil {
+		return err
+	}
+	allowed := vfs.checkLandlockAccess(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_SYM)
+	parentVD.DecRef(ctx)
+	if !allowed {
+		return linuxerr.EACCES
+	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
@@ -733,6 +934,17 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 	if pop.FollowFinalSymlink {
 		ctx.Warningf("VirtualFilesystem.UnlinkAt: file deletion paths can't follow final symlink")
 		return linuxerr.EINVAL
+	}
+
+	// Matches Linux security/landlock/fs.c:hook_path_unlink()
+	parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+	if err != nil {
+		return err
+	}
+	allowed := vfs.checkLandlockAccess(ctx, creds, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
+	parentVD.DecRef(ctx)
+	if !allowed {
+		return linuxerr.EACCES
 	}
 
 	rp := vfs.getResolvingPath(creds, pop)
@@ -1066,4 +1278,188 @@ func (vd VirtualDentry) Mount() *Mount {
 // on the returned Dentry.
 func (vd VirtualDentry) Dentry() *Dentry {
 	return vd.dentry
+}
+
+// WalkUp walks up the dentry tree from vd.
+// It calls fn for each dentry/mount pair.
+// If fn returns false or an error, the walk stops.
+// WalkUp handles mount crossing and loop detection.
+func (vfs *VirtualFilesystem) WalkUp(ctx context.Context, vd VirtualDentry, fn func(VirtualDentry) (bool, error)) error {
+	// Keep track of visited dentries to detect loops.
+	visited := make(map[VirtualDentry]struct{})
+
+	vd.IncRef()
+	// vd is reassigned during mount crossing and directory traversal within the
+	// loop, so we must wrap vd.DecRef(ctx) in a deferred closure to ensure it
+	// decrements the final value of vd at function exit. This was necessary to
+	// fix a sentry panic (double-decrement of mount reference count) triggered
+	// during Landlock test execution.
+	defer func() {
+		vd.DecRef(ctx)
+	}()
+
+	for {
+		if _, ok := visited[vd]; ok {
+			return linuxerr.ELOOP
+		}
+		visited[vd] = struct{}{}
+
+		cont, err := fn(vd)
+		if err != nil {
+			return err
+		}
+		if !cont {
+			return nil
+		}
+
+		if vd.dentry == vd.mount.root {
+			// Cross mount.
+			nextVD := vfs.getMountpointAt(ctx, vd.mount, VirtualDentry{})
+			if !nextVD.Ok() {
+				// Hit the root of mount tree.
+				return nil
+			}
+			vd.DecRef(ctx)
+			vd = nextVD
+		} else {
+			// Up inside the same mount.
+			var parentD *Dentry
+			for {
+				parentD = vd.dentry.Parent()
+				if parentD == nil {
+					break
+				}
+				if parentD.TryIncRef() {
+					break
+				}
+				// Try again, parent pointer must be changing.
+			}
+			if parentD == nil {
+				return nil
+			}
+			// Only decrement the dentry, as we reuse the mount reference.
+			vd.dentry.DecRef(ctx)
+			vd = VirtualDentry{
+				mount:  vd.mount,
+				dentry: parentD,
+			}
+		}
+	}
+}
+
+// Matches Linux security/landlock/fs.c:current_check_access_path
+func (vfs *VirtualFilesystem) checkLandlockAccess(ctx context.Context, creds *auth.Credentials, vd VirtualDentry, accessRequest uint64) bool {
+	dom := creds.LandlockDomain
+	if dom == nil {
+		return true
+	}
+	return dom.CheckAccess(ctx, vfs, vd, accessRequest)
+}
+
+// Matches Linux security/landlock/fs.c:hook_file_open
+func (vfs *VirtualFilesystem) checkLandlockOpen(ctx context.Context, creds *auth.Credentials, fd *FileDescription, opts *OpenOptions) error {
+	dom := creds.LandlockDomain
+	if dom == nil {
+		return nil
+	}
+
+	stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil {
+		return err
+	}
+	isDir := (stat.Mode & linux.S_IFMT) == linux.S_IFDIR
+
+	if fd.IsCreated() {
+		fileType := stat.Mode & linux.S_IFMT
+		var makeAccess uint64
+		switch fileType {
+		case linux.S_IFREG:
+			makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_REG
+		case linux.S_IFSOCK:
+			makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_SOCK
+		case linux.S_IFIFO:
+			makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
+		case linux.S_IFCHR:
+			makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
+		case linux.S_IFBLK:
+			makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
+		default:
+			makeAccess = linux.LANDLOCK_ACCESS_FS_MAKE_REG
+		}
+
+		parentVD := MakeVirtualDentry(fd.Mount(), fd.Dentry().Parent())
+		if parentVD.dentry == nil {
+			return linuxerr.EACCES
+		}
+		if !dom.CheckAccess(ctx, vfs, parentVD, makeAccess) {
+			// Cleanup: unlink the created file.
+			// NOTE: This post-hoc cleanup is a deviation from Linux, which checks
+			// access BEFORE creating the file. This introduces side-effects on gVisor
+			// that do not occur on Linux, such as generating inotify events (create,
+			// delete) and modifying the parent directory's metadata (mtime/ctime).
+			if pathStr, err := vfs.PathnameInFilesystem(ctx, MakeVirtualDentry(fd.Mount(), fd.Dentry())); err == nil {
+				pop := &PathOperation{
+					Start: parentVD,
+					Path:  fspath.Parse(path.Base(pathStr)),
+				}
+				// Matches gVisor internal logic to bypass Landlock policy when performing post-hoc cleanup.
+				// This is a surgical modification to support Landlock on gVisor: since we perform access
+				// checks after file creation, a failed create results in cleanup (unlinking). If the
+				// current Landlock domain also blocks REMOVE_FILE on the parent directory, this cleanup
+				// will fail, leaking the unauthorized file. We clone credentials and clear the
+				// LandlockDomain to bypass the REMOVE_FILE check during cleanup, resolving this compatibility
+				// scenario.
+				unlinkCreds := creds.Fork()
+				if unlinkCreds.LandlockDomain != nil {
+					unlinkCreds.LandlockDomain.DecRef(ctx)
+					unlinkCreds.LandlockDomain = nil
+				}
+				_ = vfs.UnlinkAt(ctx, unlinkCreds, pop)
+			}
+			return linuxerr.EACCES
+		}
+	}
+
+	var fileAccess uint64
+	if (opts.Flags&linux.O_ACCMODE) == linux.O_RDONLY || (opts.Flags&linux.O_ACCMODE) == linux.O_RDWR {
+		if isDir {
+			fileAccess |= linux.LANDLOCK_ACCESS_FS_READ_DIR
+		} else {
+			fileAccess |= linux.LANDLOCK_ACCESS_FS_READ_FILE
+		}
+	}
+	if (opts.Flags&linux.O_ACCMODE) == linux.O_WRONLY || (opts.Flags&linux.O_ACCMODE) == linux.O_RDWR {
+		fileAccess |= linux.LANDLOCK_ACCESS_FS_WRITE_FILE
+	}
+	if opts.FileExec {
+		fileAccess |= linux.LANDLOCK_ACCESS_FS_EXECUTE
+	}
+
+	vd := MakeVirtualDentry(fd.Mount(), fd.Dentry())
+	if !dom.CheckAccess(ctx, vfs, vd, fileAccess) {
+		return linuxerr.EACCES
+	}
+
+	return nil
+}
+
+// Matches Linux security/landlock/fs.c:get_mode_access
+func getModeAccess(mode linux.FileMode) uint64 {
+	switch mode.FileType() {
+	case linux.ModeSymlink:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_SYM
+	case linux.ModeDirectory:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_DIR
+	case linux.ModeCharacterDevice:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
+	case linux.ModeBlockDevice:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
+	case linux.ModeNamedPipe:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
+	case linux.ModeSocket:
+		return linux.LANDLOCK_ACCESS_FS_MAKE_SOCK
+	case linux.ModeRegular, 0:
+	default:
+	}
+	return linux.LANDLOCK_ACCESS_FS_MAKE_REG
 }

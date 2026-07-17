@@ -16,10 +16,25 @@ package auth
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
+
+// LandlockDomain represents a Landlock domain.
+type LandlockDomain interface {
+	// Clone returns a clone of the Landlock domain.
+	Clone() LandlockDomain
+
+	// DecRef decrements the reference count of the domain.
+	DecRef(ctx context.Context)
+
+	// CheckAccess checks if the domain allows the requested access to the given VirtualDentry.
+	// The vfsObj and vd arguments are passed as any to avoid circular dependencies.
+	// They must be cast to *vfs.VirtualFilesystem and vfs.VirtualDentry by the implementation.
+	CheckAccess(ctx context.Context, vfsObj any, vd any, accessRequest uint64) bool
+}
 
 // Credentials contains information required to authorize privileged operations
 // in a user namespace.
@@ -58,6 +73,10 @@ type Credentials struct {
 
 	// The user namespace associated with the owner of the credentials.
 	UserNamespace *UserNamespace
+
+	// LandlockDomain is the Landlock domain active on these credentials.
+	// It is cloned when credentials are cloned.
+	LandlockDomain LandlockDomain `state:"nosave"`
 }
 
 // NewAnonymousCredentials returns a set of credentials with no capabilities in
@@ -149,6 +168,9 @@ func NewUserCredentials(kuid KUID, kgid KGID, extraKGIDs []KGID, capabilities *T
 func (c *Credentials) Fork() *Credentials {
 	nc := new(Credentials)
 	*nc = *c // Copy-by-value; this is legal for all fields.
+	if c.LandlockDomain != nil {
+		nc.LandlockDomain = c.LandlockDomain.Clone()
+	}
 	return nc
 }
 

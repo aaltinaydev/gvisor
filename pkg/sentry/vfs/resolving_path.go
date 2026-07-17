@@ -487,3 +487,25 @@ func (rp *ResolvingPath) canHandleError(err error) bool {
 func (rp *ResolvingPath) MustBeDir() bool {
 	return rp.mustBeDir
 }
+
+// CheckCreateAccess checks Landlock create permissions for a child file.
+// It maps the mode to LANDLOCK_ACCESS_FS_MAKE_* access right, and calls
+// checkLandlockAccess.
+// Matches gVisor [pkg/sentry/vfs/vfs.go]:checkLandlockAccess()
+func (rp *ResolvingPath) CheckCreateAccess(ctx context.Context, parent *Dentry, mode linux.FileMode) error {
+	dom := rp.creds.LandlockDomain
+	if dom == nil {
+		return nil
+	}
+
+	makeAccess := getModeAccess(mode)
+	parentVD := VirtualDentry{
+		mount:  rp.mount,
+		dentry: parent,
+	}
+
+	if !rp.vfs.checkLandlockAccess(ctx, rp.creds, parentVD, makeAccess) {
+		return linuxerr.EACCES
+	}
+	return nil
+}
