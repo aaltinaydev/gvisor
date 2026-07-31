@@ -1651,6 +1651,16 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 	d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
 }
 
+// VFSParent implements vfs.DentryParent.VFSParent.
+// Matches gVisor [pkg/sentry/fsimpl/gofer/gofer.go]:[VFSParent]()
+// Rationale: Implements vfs.DentryParent interface for gofer dentries to enable Landlock bottom-up dentry tree traversal during path access enforcement.
+func (d *dentry) VFSParent() *vfs.Dentry {
+	if parent := d.parent.Load(); parent != nil {
+		return &parent.vfsd
+	}
+	return nil
+}
+
 // checkCachingLocked should be called after d's reference count becomes 0 or
 // it becomes disowned.
 //

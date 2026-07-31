@@ -609,6 +609,16 @@ func (d *dentry) Watches() *vfs.Watches {
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
 func (d *dentry) OnZeroWatches(context.Context) {}
 
+// VFSParent implements vfs.DentryParent.VFSParent.
+// Matches gVisor [pkg/sentry/fsimpl/tmpfs/tmpfs.go]:[VFSParent]()
+// Rationale: Implements vfs.DentryParent interface for tmpfs dentries to enable Landlock bottom-up dentry tree traversal during path access enforcement.
+func (d *dentry) VFSParent() *vfs.Dentry {
+	if parent := d.parent.Load(); parent != nil {
+		return &parent.vfsd
+	}
+	return nil
+}
+
 // inode represents a filesystem object.
 //
 // +stateify savable

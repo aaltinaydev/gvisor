@@ -359,3 +359,22 @@ func ClearSUIDAndSGID(mode uint32) uint32 {
 	}
 	return mode
 }
+
+// LandlockDomain is an interface matching landlock.LandlockDomain.
+type LandlockDomain interface {
+	CanAccessPath(vfsObj *VirtualFilesystem, vd VirtualDentry, accessMask uint64) bool
+}
+
+// CheckLandlockPathAccess checks if creds's Landlock domain permits accessMask on vd.
+// Matches Linux [security/landlock/fs.c]:current_check_access_path()
+func CheckLandlockPathAccess(vfsObj *VirtualFilesystem, creds *auth.Credentials, vd VirtualDentry, accessMask uint64) error {
+	if creds == nil || creds.LandlockDomain == nil {
+		return nil
+	}
+	if dom, ok := creds.LandlockDomain.(LandlockDomain); ok {
+		if !dom.CanAccessPath(vfsObj, vd, accessMask) {
+			return linuxerr.EACCES
+		}
+	}
+	return nil
+}

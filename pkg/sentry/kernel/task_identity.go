@@ -530,3 +530,11 @@ func (t *Task) ClearAmbientCapabilities() {
 	creds.AmbientCaps = 0
 	t.creds.Store(creds)
 }
+
+// SetLandlockDomain updates t's credentials with a new LandlockDomain.
+// Matches Linux [security/landlock/syscalls.c]:sys_landlock_restrict_self()
+func (t *Task) SetLandlockDomain(dom any) {
+	creds := t.Credentials().Fork()
+	creds.LandlockDomain = dom
+	t.creds.Store(creds)
+}

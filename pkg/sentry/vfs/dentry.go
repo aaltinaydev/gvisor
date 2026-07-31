@@ -91,6 +91,20 @@ func (d *Dentry) Impl() DentryImpl {
 	return d.impl
 }
 
+// DentryParent is an optional interface implemented by DentryImpls that track parent dentries.
+type DentryParent interface {
+	VFSParent() *Dentry
+}
+
+// Parent returns d's parent dentry in its filesystem, or nil if d is a filesystem root or does not track parent.
+// Matches gVisor [pkg/sentry/vfs/dentry.go]:[Parent]()
+func (d *Dentry) Parent() *Dentry {
+	if p, ok := d.impl.(DentryParent); ok {
+		return p.VFSParent()
+	}
+	return nil
+}
+
 // DentryImpl contains implementation details for a Dentry. Implementations of
 // DentryImpl should contain their associated Dentry by value as their first
 // field.

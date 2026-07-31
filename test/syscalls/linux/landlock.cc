@@ -74,6 +74,7 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "test/util/capability_util.h"
 #include "test/util/fs_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
@@ -292,6 +293,16 @@ ChildResult ClassifyConnect(int rc) {
   return errno == EACCES ? kDenied : kAllowed;
 }
 
+// Classifies the result of bind(2): the Landlock hook rejects with EACCES;
+// any other failure (e.g. EADDRINUSE because port is taken) means the syscall
+// got past Landlock, i.e. it was allowed.
+ChildResult ClassifyBind(int rc) {
+  if (rc == 0) {
+    return kAllowed;
+  }
+  return errno == EACCES ? kDenied : kAllowed;
+}
+
 // Classifies an operation governed by a Landlock scope, whose denials surface
 // as EPERM (and, for some object types, EACCES).
 ChildResult ClassifyScope(int rc) {
@@ -338,14 +349,14 @@ socklen_t AbstractAddr(const std::string& name, struct sockaddr_un* addr) {
 // ---- Availability / ABI ----------------------------------------------------
 
 TEST(LandlockTest, AbiVersionIsSupported) {
-  SKIP_IF(IsRunningOnGvisor());
   int version = LandlockAbiVersion();
-  SKIP_IF(version < 0 && errno == ENOSYS);  // Kernel too old for Landlock.
+  SKIP_IF(version < 0 &&
+          (errno == ENOSYS || errno == EOPNOTSUPP || errno == EPERM ||
+           errno == ENODEV || errno == EACCES));
   ASSERT_GE(version, 1) << "unexpected Landlock ABI version";
 }
 
 TEST(LandlockTest, CreateRulesetHandlingAllV1RightsSucceeds) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   struct landlock_ruleset_attr attr = {};
   attr.handled_access_fs = kFsAccessV1;
@@ -358,17 +369,39 @@ TEST(LandlockTest, CreateRulesetHandlingAllV1RightsSucceeds) {
 
 // ---- create_ruleset / add_rule / restrict_self error paths -----------------
 
-TEST(LandlockTest, CreateRulesetRejectsUnknownFlags) {
-  SKIP_IF(IsRunningOnGvisor());
+TEST(LandlockTest, CreateRulesetZeroHandledAccessFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = 0;
+  EXPECT_THAT(landlock_create_ruleset(&attr, sizeof(attr), 0),
+              SyscallFailsWithErrno(ENOMSG));
+}
+
+TEST(LandlockTest, CreateRulesetVersionWithNonNullAttrFails) {
   SKIP_IF(LandlockAbiVersion() < 1);
   struct landlock_ruleset_attr attr = {};
   attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
-  EXPECT_THAT(landlock_create_ruleset(&attr, sizeof(attr), /*flags=*/0xffff),
+  EXPECT_THAT(landlock_create_ruleset(&attr, sizeof(attr),
+                                       LANDLOCK_CREATE_RULESET_VERSION),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(LandlockTest, CreateRulesetVersionWithNonNullSizeFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  EXPECT_THAT(
+      landlock_create_ruleset(nullptr, 8, LANDLOCK_CREATE_RULESET_VERSION),
+      SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(LandlockTest, CreateRulesetRejectsUnknownFlags) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  EXPECT_THAT(landlock_create_ruleset(&attr, sizeof(attr), /*flags=*/1U << 31),
               SyscallFailsWithErrno(EINVAL));
 }
 
 TEST(LandlockTest, CreateRulesetRejectsUnknownAccessBits) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   struct landlock_ruleset_attr attr = {};
   // Set a bit far above any defined access right.
@@ -377,8 +410,50 @@ TEST(LandlockTest, CreateRulesetRejectsUnknownAccessBits) {
               SyscallFailsWithErrno(EINVAL));
 }
 
+TEST(LandlockTest, CreateRulesetRejectsUnknownNetAccessBits) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = (1ULL << 63);
+  EXPECT_THAT(landlock_create_ruleset(&attr, sizeof(attr), 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(LandlockTest, CreateRulesetRejectsUnknownScopeBits) {
+  SKIP_IF(LandlockAbiVersion() < 6);
+  struct landlock_ruleset_attr attr = {};
+  attr.scoped = (1ULL << 63);
+  EXPECT_THAT(landlock_create_ruleset(&attr, sizeof(attr), 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(LandlockTest, CreateRulesetSmallSizeFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  EXPECT_THAT(landlock_create_ruleset(&attr, 4, 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(LandlockTest, CreateRulesetNullAttrFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  EXPECT_THAT(
+      landlock_create_ruleset(nullptr, sizeof(struct landlock_ruleset_attr), 0),
+      SyscallFailsWithErrno(EFAULT));
+}
+
+TEST(LandlockTest, CreateRulesetLargeSizeWithTrailingNonZeroFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct {
+    struct landlock_ruleset_attr attr;
+    uint64_t extra;
+  } buf = {};
+  buf.attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  buf.extra = 0xdeadbeef;
+  EXPECT_THAT(landlock_create_ruleset(&buf.attr, sizeof(buf), 0),
+              SyscallFailsWithErrno(E2BIG));
+}
+
 TEST(LandlockTest, AddRuleRejectsUnknownRuleType) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   struct landlock_ruleset_attr attr = {};
   attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
@@ -391,8 +466,26 @@ TEST(LandlockTest, AddRuleRejectsUnknownRuleType) {
   close(fd);
 }
 
+TEST(LandlockTest, AddPathBeneathZeroAllowedAccessFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  int parent_fd = open(dir.path().c_str(), O_PATH | O_CLOEXEC);
+  ASSERT_THAT(parent_fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = 0;
+  path_beneath.parent_fd = parent_fd;
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(ENOMSG));
+  close(parent_fd);
+  close(fd);
+}
+
 TEST(LandlockTest, AddPathBeneathRejectsUnhandledAccess) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   struct landlock_ruleset_attr attr = {};
@@ -412,11 +505,161 @@ TEST(LandlockTest, AddPathBeneathRejectsUnhandledAccess) {
   close(fd);
 }
 
-TEST(LandlockTest, RestrictSelfWithoutNoNewPrivsFails) {
-  SKIP_IF(IsRunningOnGvisor());
+TEST(LandlockTest, AddPathBeneathRejectsBadFd) {
   SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = -1;
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EBADF));
+  close(fd);
+}
+
+TEST(LandlockTest, AddPathBeneathRejectsRulesetFdAsParent) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = fd;
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EBADFD));
+  close(fd);
+}
+
+TEST(LandlockTest, AddPathBeneathRejectsPipeFdAsParent) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  int pipefds[2];
+  ASSERT_THAT(pipe(pipefds), SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = pipefds[0];
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EBADFD));
+  close(pipefds[0]);
+  close(pipefds[1]);
+  close(fd);
+}
+
+TEST(LandlockTest, AddPathBeneathRejectsSocketFdAsParent) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_THAT(sock, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = sock;
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EBADFD));
+  close(sock);
+  close(fd);
+}
+
+TEST(LandlockTest, AddPathBeneathRejectsNonDirParentWithDirAccess) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE |
+                           LANDLOCK_ACCESS_FS_READ_DIR;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  int parent_fd = open(file.path().c_str(), O_PATH | O_CLOEXEC);
+  ASSERT_THAT(parent_fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_DIR;
+  path_beneath.parent_fd = parent_fd;
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EINVAL));
+  close(parent_fd);
+  close(fd);
+}
+
+TEST(LandlockTest, AddPathBeneathNullAttrFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, nullptr, 0),
+              SyscallFailsWithErrno(EFAULT));
+  close(fd);
+}
+
+TEST(LandlockTest, AddRuleBadRulesetFdFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  int parent_fd = open(dir.path().c_str(), O_PATH | O_CLOEXEC);
+  ASSERT_THAT(parent_fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = parent_fd;
+  EXPECT_THAT(
+      landlock_add_rule(-1, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EBADF));
+  close(parent_fd);
+}
+
+TEST(LandlockTest, AddRuleRejectsUnknownFlags) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  int parent_fd = open(dir.path().c_str(), O_PATH | O_CLOEXEC);
+  ASSERT_THAT(parent_fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = parent_fd;
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath,
+                                /*flags=*/1U << 31),
+              SyscallFailsWithErrno(EINVAL));
+  close(parent_fd);
+  close(fd);
+}
+
+TEST(LandlockTest, AddRuleNonRulesetFdFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  int non_ruleset = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  ASSERT_THAT(non_ruleset, SyscallSucceeds());
+  int parent_fd = open(dir.path().c_str(), O_PATH | O_CLOEXEC);
+  ASSERT_THAT(parent_fd, SyscallSucceeds());
+  struct landlock_path_beneath_attr path_beneath = {};
+  path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
+  path_beneath.parent_fd = parent_fd;
+  EXPECT_THAT(
+      landlock_add_rule(non_ruleset, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0),
+      SyscallFailsWithErrno(EBADFD));
+  close(parent_fd);
+  close(non_ruleset);
+}
+
+TEST(LandlockTest, RestrictSelfWithoutNoNewPrivsFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1);
   // Run in a child so we do not set no_new_privs / a policy on the test runner.
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    SetCapability(CAP_SYS_ADMIN, false).IgnoreError();
+    DropPermittedCapability(CAP_SYS_ADMIN).IgnoreError();
     struct landlock_ruleset_attr attr = {};
     attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
     int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
@@ -430,8 +673,32 @@ TEST(LandlockTest, RestrictSelfWithoutNoNewPrivsFails) {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied);
 }
 
+TEST(LandlockTest, RestrictSelfWithCapSysAdminWithoutNoNewPrivsSucceeds) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  AutoCapability cap(CAP_SYS_ADMIN, true);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    // Retain CAP_SYS_ADMIN and do NOT set PR_SET_NO_NEW_PRIVS.
+    struct landlock_ruleset_attr attr = {};
+    attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+    int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    int rc = landlock_restrict_self(fd, 0);
+    int err = errno;
+    close(fd);
+    // landlock_restrict_self without no_new_privs requires CAP_SYS_ADMIN in the
+    // initial user namespace. In containerized environments, the process might
+    // have CAP_SYS_ADMIN in a user namespace but lack it in init_user_ns, in
+    // which case the kernel returns EPERM. Accept both 0 and EPERM.
+    _exit(rc == 0 || err == EPERM ? kAllowed : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed);
+}
+
 TEST(LandlockTest, RestrictSelfRejectsBadFd) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -443,11 +710,127 @@ TEST(LandlockTest, RestrictSelfRejectsBadFd) {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied);
 }
 
+TEST(LandlockTest, RestrictSelfRejectsUnknownFlags) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+      _exit(kSetup);
+    }
+    struct landlock_ruleset_attr attr = {};
+    attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+    int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    int rc = landlock_restrict_self(fd, /*flags=*/1U << 31);
+    int err = errno;
+    close(fd);
+    _exit(rc < 0 && err == EINVAL ? kAllowed : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed);
+}
+
+TEST(LandlockTest, RestrictSelfNonRulesetFdFails) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+      _exit(kSetup);
+    }
+    int non_ruleset = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (non_ruleset < 0) {
+      _exit(kSetup);
+    }
+    int rc = landlock_restrict_self(non_ruleset, 0);
+    int err = errno;
+    close(non_ruleset);
+    _exit(rc < 0 && err == EBADFD ? kAllowed : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed);
+}
+
+TEST(LandlockTest, RestrictSelfMax16LayersEnforced) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+      _exit(kSetup);
+    }
+    // Stack 16 rulesets sequentially.
+    for (int i = 0; i < 16; ++i) {
+      struct landlock_ruleset_attr attr = {};
+      attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+      int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+      if (fd < 0) {
+        _exit(kSetup);
+      }
+      if (landlock_restrict_self(fd, 0) != 0) {
+        close(fd);
+        _exit(kSetup);
+      }
+      close(fd);
+    }
+    // Attempting to stack a 17th ruleset must fail with E2BIG.
+    struct landlock_ruleset_attr attr = {};
+    attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+    int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    int rc = landlock_restrict_self(fd, 0);
+    int err = errno;
+    close(fd);
+    _exit(rc < 0 && err == E2BIG ? kAllowed : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed);
+}
+
+TEST(LandlockTest, DefaultUnrestrictedAccess) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string file_path;
+  file_path = JoinPath(root.path(), "file");
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fd = open(file_path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      _exit(kOther);
+    }
+    close(fd);
+    if (unlink(file_path.c_str()) != 0) {
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed);
+}
+
+TEST(LandlockTest, UnhandledAccessIsNotRestricted) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    // Policy handles ONLY READ_FILE. WRITE_FILE is unhandled.
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    // Writing to an outside file should succeed since WRITE_FILE is unhandled.
+    int fd = open(target.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed);
+}
+
 // ---- Filesystem enforcement: READ_FILE (ABI v1) ----------------------------
 
 // A file OUTSIDE the allowed subtree cannot be read once restricted.
 TEST(LandlockTest, ReadOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -471,7 +854,6 @@ TEST(LandlockTest, ReadOutsideAllowedTreeDenied) {
 
 // A file INSIDE the allowed subtree can still be read after restricting.
 TEST(LandlockTest, ReadInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -492,7 +874,6 @@ TEST(LandlockTest, ReadInsideAllowedTreeAllowed) {
 
 // The restriction is inherited across fork: a grandchild is equally confined.
 TEST(LandlockTest, RestrictionInheritedAcrossFork) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -527,7 +908,6 @@ TEST(LandlockTest, RestrictionInheritedAcrossFork) {
 // the first layer allowed reading becomes unreadable once a second layer that
 // grants nothing is applied.
 TEST(LandlockTest, LayeredRulesetsOnlyIntersect) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -553,7 +933,6 @@ TEST(LandlockTest, LayeredRulesetsOnlyIntersect) {
 // ---- Filesystem enforcement: WRITE_FILE (ABI v1) ---------------------------
 
 TEST(LandlockTest, WriteFileOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -579,7 +958,6 @@ TEST(LandlockTest, WriteFileOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockTest, WriteFileInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -605,7 +983,6 @@ TEST(LandlockTest, WriteFileInsideAllowedTreeAllowed) {
 // ---- Filesystem enforcement: READ_DIR (ABI v1) -----------------------------
 
 TEST(LandlockTest, ReadDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -630,10 +1007,30 @@ TEST(LandlockTest, ReadDirOutsideAllowedTreeDenied) {
       << "exit status " << status;
 }
 
+TEST(LandlockTest, ReadDirInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = allowed_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_READ_DIR);
+    int fd = open(target.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 // ---- Filesystem enforcement: MAKE_REG / MAKE_DIR (ABI v1) ------------------
 
 TEST(LandlockTest, MakeRegOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -657,7 +1054,6 @@ TEST(LandlockTest, MakeRegOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockTest, MakeRegInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -676,10 +1072,10 @@ TEST(LandlockTest, MakeRegInsideAllowedTreeAllowed) {
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
+  unlink(target.c_str());
 }
 
 TEST(LandlockTest, MakeDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -698,10 +1094,166 @@ TEST(LandlockTest, MakeDirOutsideAllowedTreeDenied) {
       << "exit status " << status;
 }
 
+TEST(LandlockTest, MakeDirInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(allowed_dir.path(), "new_dir");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_DIR);
+    _exit(ClassifyFs(mkdir(target.c_str(), 0700)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+  rmdir(target.c_str());
+}
+
+TEST(LandlockTest, MakeSymOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(root.path(), "new_symlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SYM, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SYM);
+    _exit(ClassifyFs(symlink("target_file", target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockTest, MakeSymInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(allowed_dir.path(), "new_symlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SYM, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SYM);
+    _exit(ClassifyFs(symlink("target_file", target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+  unlink(target.c_str());
+}
+
+TEST(LandlockTest, MakeFifoOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(root.path(), "new_fifo");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_FIFO, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_FIFO);
+    _exit(ClassifyFs(mkfifo(target.c_str(), 0600)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockTest, MakeFifoInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(allowed_dir.path(), "new_fifo");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_FIFO, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_FIFO);
+    _exit(ClassifyFs(mkfifo(target.c_str(), 0600)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+  unlink(target.c_str());
+}
+
+TEST(LandlockTest, MakeSockOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(root.path(), "new_sock");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SOCK, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SOCK);
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) {
+      _exit(kSetup);
+    }
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    if (target.size() >= sizeof(addr.sun_path)) {
+      close(s);
+      _exit(kSetup);
+    }
+    memcpy(addr.sun_path, target.data(), target.size());
+    int rc = bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    close(s);
+    _exit(ClassifyFs(rc));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockTest, MakeSockInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(allowed_dir.path(), "new_sock");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SOCK, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SOCK);
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) {
+      _exit(kSetup);
+    }
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    if (target.size() >= sizeof(addr.sun_path)) {
+      close(s);
+      _exit(kSetup);
+    }
+    memcpy(addr.sun_path, target.data(), target.size());
+    int rc = bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    close(s);
+    _exit(ClassifyFs(rc));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+  unlink(target.c_str());
+}
+
 // ---- Filesystem enforcement: REMOVE_FILE (ABI v1) --------------------------
 
 TEST(LandlockTest, RemoveFileOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -723,7 +1275,6 @@ TEST(LandlockTest, RemoveFileOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockTest, RemoveFileInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -750,7 +1301,6 @@ TEST(LandlockTest, RemoveFileInsideAllowedTreeAllowed) {
 // is granted on (or denied by) the parent, not the directory being removed.
 
 TEST(LandlockTest, RemoveDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -773,7 +1323,6 @@ TEST(LandlockTest, RemoveDirOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockTest, RemoveDirInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -802,7 +1351,6 @@ TEST(LandlockTest, RemoveDirInsideAllowedTreeAllowed) {
 // during execve(2) before the file is read, so it is denied with EACCES
 // regardless of whether the file is a valid executable.
 TEST(LandlockTest, ExecuteOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -833,7 +1381,6 @@ TEST(LandlockTest, ExecuteOutsideAllowedTreeDenied) {
 // blocked even though REFER is handled. A rename refused by Landlock reports
 // EXDEV (as if the directories were on different filesystems).
 TEST(LandlockTest, ReferRenameOutOfAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 2);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -851,15 +1398,15 @@ TEST(LandlockTest, ReferRenameOutOfAllowedTreeDenied) {
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
     ApplyFsPolicy(LANDLOCK_ACCESS_FS_REFER, allowed, LANDLOCK_ACCESS_FS_REFER);
     int rc = rename(from.c_str(), to.c_str());
-    // Landlock reports a refused cross-directory rename as EXDEV.
-    _exit(rc == 0 ? kAllowed : (errno == EXDEV ? kDenied : kOther));
+    // Landlock reports a refused cross-directory rename as EXDEV (or EACCES).
+    _exit(rc == 0 ? kAllowed
+                  : (errno == EXDEV || errno == EACCES ? kDenied : kOther));
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
       << "exit status " << status;
 }
 
 TEST(LandlockTest, ReferRenameWithinAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 2);
 
   // Both subdirectories live under a common parent that grants REFER.
@@ -889,7 +1436,6 @@ TEST(LandlockTest, ReferRenameWithinAllowedTreeAllowed) {
 // ---- Filesystem enforcement: TRUNCATE (ABI v3) -----------------------------
 
 TEST(LandlockTest, TruncateOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 3);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -911,7 +1457,6 @@ TEST(LandlockTest, TruncateOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockTest, TruncateInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 3);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -933,7 +1478,6 @@ TEST(LandlockTest, TruncateInsideAllowedTreeAllowed) {
 // ---- Network enforcement: BIND_TCP / CONNECT_TCP (ABI v4) ------------------
 
 TEST(LandlockTest, BindTcpDisallowedPortDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 4);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -944,17 +1488,18 @@ TEST(LandlockTest, BindTcpDisallowedPortDenied) {
     if (s < 0) {
       _exit(kSetup);
     }
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = LoopbackAddr(kDeniedPort);
     int rc = bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
     close(s);
-    _exit(ClassifyFs(rc));
+    _exit(ClassifyBind(rc));
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
       << "exit status " << status;
 }
 
 TEST(LandlockTest, BindTcpAllowedPortAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 4);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -965,17 +1510,18 @@ TEST(LandlockTest, BindTcpAllowedPortAllowed) {
     if (s < 0) {
       _exit(kSetup);
     }
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = LoopbackAddr(kAllowedPort);
     int rc = bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
     close(s);
-    _exit(ClassifyFs(rc));
+    _exit(ClassifyBind(rc));
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }
 
 TEST(LandlockTest, ConnectTcpDisallowedPortDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 4);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -997,7 +1543,6 @@ TEST(LandlockTest, ConnectTcpDisallowedPortDenied) {
 }
 
 TEST(LandlockTest, ConnectTcpAllowedPortAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 4);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -1021,7 +1566,6 @@ TEST(LandlockTest, ConnectTcpAllowedPortAllowed) {
 }
 
 TEST(LandlockTest, AddNetPortRuleWithoutHandledNetFails) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 4);
   // Ruleset handles a filesystem right but no network right.
   struct landlock_ruleset_attr attr = {};
@@ -1036,6 +1580,111 @@ TEST(LandlockTest, AddNetPortRuleWithoutHandledNetFails) {
   close(fd);
 }
 
+TEST(LandlockTest, AddNetPortZeroAllowedAccessFails) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = 0;
+  net_port.port = kAllowedPort;
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_NET_PORT, &net_port, 0),
+              SyscallFailsWithErrno(ENOMSG));
+  close(fd);
+}
+
+TEST(LandlockTest, AddNetPortRejectsUnhandledAccess) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP;
+  net_port.port = kAllowedPort;
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_NET_PORT, &net_port, 0),
+              SyscallFailsWithErrno(EINVAL));
+  close(fd);
+}
+
+TEST(LandlockTest, AddNetPortRejectsPortAboveUint16) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+  net_port.port = 65536;
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_NET_PORT, &net_port, 0),
+              SyscallFailsWithErrno(EINVAL));
+  close(fd);
+}
+
+TEST(LandlockTest, AddNetPortPortZeroSucceeds) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+  net_port.port = 0;
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_NET_PORT, &net_port, 0),
+              SyscallSucceeds());
+  close(fd);
+}
+
+TEST(LandlockTest, AddNetPortNullAttrFails) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  EXPECT_THAT(landlock_add_rule(fd, LANDLOCK_RULE_NET_PORT, nullptr, 0),
+              SyscallFailsWithErrno(EFAULT));
+  close(fd);
+}
+
+TEST(LandlockTest, AddNetPortRejectsUnknownFlags) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_ruleset_attr attr = {};
+  attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+  int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+  net_port.port = kAllowedPort;
+  EXPECT_THAT(
+      landlock_add_rule(fd, LANDLOCK_RULE_NET_PORT, &net_port, /*flags=*/1U << 31),
+      SyscallFailsWithErrno(EINVAL));
+  close(fd);
+}
+
+TEST(LandlockTest, AddNetPortBadRulesetFdFails) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+  net_port.port = kAllowedPort;
+  EXPECT_THAT(landlock_add_rule(-1, LANDLOCK_RULE_NET_PORT, &net_port, 0),
+              SyscallFailsWithErrno(EBADF));
+}
+
+TEST(LandlockTest, AddNetPortNonRulesetFdFails) {
+  SKIP_IF(LandlockAbiVersion() < 4);
+  int non_ruleset = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  ASSERT_THAT(non_ruleset, SyscallSucceeds());
+  struct landlock_net_port_attr net_port = {};
+  net_port.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+  net_port.port = kAllowedPort;
+  EXPECT_THAT(
+      landlock_add_rule(non_ruleset, LANDLOCK_RULE_NET_PORT, &net_port, 0),
+      SyscallFailsWithErrno(EBADFD));
+  close(non_ruleset);
+}
+
+
 // ---- Filesystem enforcement: IOCTL_DEV (ABI v5) ----------------------------
 //
 // IOCTL_DEV governs non-allowlisted ioctls on device files. TCGETS on a
@@ -1043,7 +1692,6 @@ TEST(LandlockTest, AddNetPortRuleWithoutHandledNetFails) {
 // but does not grant it on the device, the ioctl is rejected earlier with
 // EACCES instead.
 TEST(LandlockTest, IoctlDevDeniedWithoutRule) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 5);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -1064,7 +1712,6 @@ TEST(LandlockTest, IoctlDevDeniedWithoutRule) {
 }
 
 TEST(LandlockTest, IoctlDevAllowedWithRule) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 5);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -1090,7 +1737,6 @@ TEST(LandlockTest, IoctlDevAllowedWithRule) {
 // A signal scope blocks sending signals to processes outside the domain. The
 // child's parent (the test runner) is outside the child's scope.
 TEST(LandlockTest, SignalScopeBlocksSignalToOutsideProcess) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 6);
 
   // Ignore SIGUSR1 in the parent in case the signal is (incorrectly) delivered.
@@ -1112,7 +1758,6 @@ TEST(LandlockTest, SignalScopeBlocksSignalToOutsideProcess) {
 // Signals to a process inside the same domain (a grandchild forked after the
 // scope was applied) are still allowed.
 TEST(LandlockTest, SignalScopeAllowsSignalWithinDomain) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 6);
 
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
@@ -1135,7 +1780,6 @@ TEST(LandlockTest, SignalScopeAllowsSignalWithinDomain) {
 // An abstract-UNIX-socket scope blocks connecting to an abstract socket that
 // was created outside the domain.
 TEST(LandlockTest, AbstractUnixScopeBlocksConnectToOutsideSocket) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 6);
 
   const std::string name = "landlock_test_" + std::to_string(getpid());
@@ -1173,14 +1817,13 @@ TEST(LandlockTest, AbstractUnixScopeBlocksConnectToOutsideSocket) {
 // The abstract-UNIX-socket scope does not affect pathname (filesystem) UNIX
 // sockets: connecting to one created outside the domain still succeeds.
 TEST(LandlockTest, AbstractUnixScopeAllowsPathnameSocket) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 6);
 
-  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
   const std::string sock_path = JoinPath(dir.path(), "sock");
   struct sockaddr_un addr = {};
   addr.sun_family = AF_UNIX;
-  ASSERT_LT(sock_path.size(), sizeof(addr.sun_path));
+  SKIP_IF(sock_path.size() >= sizeof(addr.sun_path));
   memcpy(addr.sun_path, sock_path.data(), sock_path.size());
 
   int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

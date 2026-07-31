@@ -837,6 +837,16 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 	}
 }
 
+// VFSParent implements vfs.DentryParent.VFSParent.
+// Matches gVisor [pkg/sentry/fsimpl/overlay/overlay.go]:[VFSParent]()
+// Rationale: Implements vfs.DentryParent interface for overlay dentries to enable Landlock bottom-up dentry tree traversal during path access enforcement.
+func (d *dentry) VFSParent() *vfs.Dentry {
+	if parent := d.parent.Load(); parent != nil {
+		return &parent.vfsd
+	}
+	return nil
+}
+
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
 // any call to yield returns false, iterLayer stops iteration.
 func (d *dentry) iterLayers(yield func(vd vfs.VirtualDentry, isUpper bool) bool) {

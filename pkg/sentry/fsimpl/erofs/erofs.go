@@ -449,6 +449,16 @@ func (d *dentry) Watches() *vfs.Watches {
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 func (d *dentry) OnZeroWatches(ctx context.Context) {}
 
+// VFSParent implements vfs.DentryParent.VFSParent.
+// Matches gVisor [pkg/sentry/fsimpl/erofs/erofs.go]:[VFSParent]()
+// Rationale: Implements vfs.DentryParent interface for erofs dentries to enable Landlock bottom-up dentry tree traversal during path access enforcement.
+func (d *dentry) VFSParent() *vfs.Dentry {
+	if parent := d.parent.Load(); parent != nil {
+		return &parent.vfsd
+	}
+	return nil
+}
+
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {

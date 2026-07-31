@@ -583,6 +583,23 @@ func (d *Dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 	d.inode.Watches().Notify(ctx, "", events, cookie, et, d.isDeleted())
 }
 
+// VFSParent implements vfs.DentryParent.VFSParent.
+// Matches gVisor [pkg/sentry/fsimpl/kernfs/kernfs.go]:[VFSParent]()
+// Rationale: Implements vfs.DentryParent interface for kernfs dentries to enable Landlock bottom-up dentry tree traversal during path access enforcement.
+func (d *Dentry) VFSParent() *vfs.Dentry {
+	if parent := d.parent.Load(); parent != nil {
+		return parent.VFSDentry()
+	}
+	return nil
+}
+
+// Parent returns the parent of this Dentry. This is not safe in general, the
+// filesystem may concurrently move d elsewhere. The caller is responsible for
+// ensuring the returned result remains valid while it is used.
+func (d *Dentry) Parent() *Dentry {
+	return d.parent.Load()
+}
+
 // Watches implements vfs.DentryImpl.Watches.
 func (d *Dentry) Watches() *vfs.Watches {
 	return d.inode.Watches()
@@ -689,13 +706,6 @@ func (d *Dentry) WalkDentryTree(ctx context.Context, vfsObj *vfs.VirtualFilesyst
 
 	target.IncRef()
 	return target, nil
-}
-
-// Parent returns the parent of this Dentry. This is not safe in general, the
-// filesystem may concurrently move d elsewhere. The caller is responsible for
-// ensuring the returned result remains valid while it is used.
-func (d *Dentry) Parent() *Dentry {
-	return d.parent.Load()
 }
 
 // The Inode interface maps filesystem-level operations that operate on paths to
