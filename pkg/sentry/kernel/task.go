@@ -472,6 +472,11 @@ type Task struct {
 	// noNewPrivs is protected by mu.
 	noNewPrivs bool
 
+	// landlockDomain is the task's Landlock domain.
+	//
+	// landlockDomain is protected by mu.
+	landlockDomain *vfs.LandlockDomain
+
 	// utsns is the task's UTS namespace.
 	//
 	// utsns is protected by mu. utsns is owned by the task goroutine.

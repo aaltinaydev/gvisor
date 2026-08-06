@@ -72,6 +72,9 @@ type TaskConfig struct {
 	// NoNewPrivs determines if the task can gain new privileges.
 	NoNewPrivs bool
 
+	// LandlockDomain is the Landlock domain of the new task.
+	LandlockDomain *vfs.LandlockDomain
+
 	// Niceness is the niceness of the new task.
 	Niceness int
 
@@ -235,6 +238,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		Origin:          cfg.Origin,
 		onDestroyAction: make(map[TaskDestroyAction]struct{}),
 		noNewPrivs:      cfg.NoNewPrivs,
+		landlockDomain:  cfg.LandlockDomain,
 		cgroup2:         cgroup2,
 	}
 	t.netns = cfg.NetworkNamespace

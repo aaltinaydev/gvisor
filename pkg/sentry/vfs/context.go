@@ -35,6 +35,9 @@ const (
 	// map[checkpoint.ResourceID]int mapping filesystem unique IDs (cf.
 	// gofer.InternalFilesystemOptions.UniqueID) to host FDs.
 	CtxRestoreFilesystemFDMap
+
+	// CtxLandlockDomain is a Context.Value key for a Landlock Domain.
+	CtxLandlockDomain
 )
 
 // MountNamespaceFromContext returns the MountNamespace used by ctx. If ctx is

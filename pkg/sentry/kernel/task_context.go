@@ -87,6 +87,8 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return ipcns
 	case CtxTask:
 		return t
+	case vfs.CtxLandlockDomain:
+		return t.LandlockDomain()
 	case auth.CtxCredentials:
 		return t.creds.Load()
 	case auth.CtxThreadGroupID:

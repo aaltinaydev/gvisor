@@ -325,6 +325,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		FDTable:          fdTable,
 		Credentials:      childCreds,
 		NoNewPrivs:       t.GetNoNewPrivs(),
+		LandlockDomain:   t.LandlockDomain(),
 		Niceness:         t.Niceness(),
 		NetworkNamespace: netns,
 		AllowedCPUMask:   t.CPUMask(),

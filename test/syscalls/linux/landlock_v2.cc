@@ -77,6 +77,9 @@ TEST(LandlockV2Test, ReferRenameWithinAllowedTreeAllowed) {
     ApplyFsPolicy(LANDLOCK_ACCESS_FS_REFER, allowed, LANDLOCK_ACCESS_FS_REFER);
     _exit(ClassifyFs(rename(from.c_str(), to.c_str())));
   }));
+  if (WIFEXITED(status) && WEXITSTATUS(status) == kAllowed) {
+    EXPECT_THAT(unlink(to.c_str()), SyscallSucceeds());
+  }
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }

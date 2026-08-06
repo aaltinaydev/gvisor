@@ -116,7 +116,7 @@ TEST(LandlockV6Test, AbstractUnixScopeAllowsPathnameSocket) {
   SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 6);
 
-  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
   const std::string sock_path = JoinPath(dir.path(), "sock");
   struct sockaddr_un addr = {};
   addr.sun_family = AF_UNIX;
@@ -147,6 +147,9 @@ TEST(LandlockV6Test, AbstractUnixScopeAllowsPathnameSocket) {
     _exit(ClassifyScope(rc));
   }));
   close(listener);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == kAllowed) {
+    EXPECT_THAT(unlink(sock_path.c_str()), SyscallSucceeds());
+  }
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }

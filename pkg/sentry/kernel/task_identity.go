@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Credentials returns t's credentials.
@@ -484,6 +485,20 @@ func (t *Task) GetNoNewPrivs() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.noNewPrivs
+}
+
+// LandlockDomain returns t's Landlock domain.
+func (t *Task) LandlockDomain() *vfs.LandlockDomain {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.landlockDomain
+}
+
+// SetLandlockDomain sets t's Landlock domain.
+func (t *Task) SetLandlockDomain(domain *vfs.LandlockDomain) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.landlockDomain = domain
 }
 
 // AmbientCapability returns whether the capability cp is in the ambient set.
