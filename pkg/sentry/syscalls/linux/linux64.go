@@ -398,9 +398,9 @@ var AMD64 = &kernel.SyscallTable{
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
-		444: syscalls.Supported("landlock_create_ruleset", LandlockCreateRuleset),
-		445: syscalls.Supported("landlock_add_rule", LandlockAddRule),
-		446: syscalls.Supported("landlock_restrict_self", LandlockRestrictSelf),
+		444: syscalls.PartiallySupported("landlock_create_ruleset", LandlockCreateRuleset, "Only ABI version 1 is supported; network and IPC scoping restrictions are not.", nil),
+		445: syscalls.PartiallySupported("landlock_add_rule", LandlockAddRule, "Only LANDLOCK_RULE_PATH_BENEATH is supported. Rules are keyed by pathname, so they do not follow a directory that is later renamed.", nil),
+		446: syscalls.PartiallySupported("landlock_restrict_self", LandlockRestrictSelf, "Only ABI version 1 filesystem access rights are enforced.", nil),
 	},
 	Emulate: map[hostarch.Addr]uintptr{
 		0xffffffffff600000: 96,  // vsyscall gettimeofday(2)
@@ -723,9 +723,9 @@ var ARM64 = &kernel.SyscallTable{
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
-		444: syscalls.Supported("landlock_create_ruleset", LandlockCreateRuleset),
-		445: syscalls.Supported("landlock_add_rule", LandlockAddRule),
-		446: syscalls.Supported("landlock_restrict_self", LandlockRestrictSelf),
+		444: syscalls.PartiallySupported("landlock_create_ruleset", LandlockCreateRuleset, "Only ABI version 1 is supported; network and IPC scoping restrictions are not.", nil),
+		445: syscalls.PartiallySupported("landlock_add_rule", LandlockAddRule, "Only LANDLOCK_RULE_PATH_BENEATH is supported. Rules are keyed by pathname, so they do not follow a directory that is later renamed.", nil),
+		446: syscalls.PartiallySupported("landlock_restrict_self", LandlockRestrictSelf, "Only ABI version 1 filesystem access rights are enforced.", nil),
 	},
 	Emulate: map[hostarch.Addr]uintptr{},
 	Missing: func(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {

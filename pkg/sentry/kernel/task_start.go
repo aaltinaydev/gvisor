@@ -243,10 +243,10 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		Origin:          cfg.Origin,
 		onDestroyAction: make(map[TaskDestroyAction]struct{}),
 		noNewPrivs:      cfg.NoNewPrivs,
-		landlockDomain:  cfg.LandlockDomain,
 		cgroup2:         cgroup2,
 	}
 	t.netns = cfg.NetworkNamespace
+	t.landlockDomain.Store(cfg.LandlockDomain)
 	t.creds.Store(cfg.Credentials)
 	t.fsContext.Store(cfg.FSContext)
 	t.endStopCond.L = &t.tg.signalHandlers.mu

@@ -60,6 +60,7 @@ struct landlock_net_port_attr {
 };
 
 constexpr uint32_t LANDLOCK_CREATE_RULESET_VERSION = (1U << 0);
+constexpr uint32_t LANDLOCK_CREATE_RULESET_ERRATA = (1U << 1);
 
 // Filesystem access rights.
 constexpr uint64_t LANDLOCK_ACCESS_FS_EXECUTE = (1ULL << 0);      // v1

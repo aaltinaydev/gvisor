@@ -28,6 +28,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "landlock_ruleset_mutex",
+    out = "landlock_ruleset_mutex.go",
+    package = "vfs",
+    prefix = "landlockRuleset",
+)
+
+declare_mutex(
     name = "epoll_instance_mutex",
     out = "epoll_instance_mutex.go",
     package = "vfs",
@@ -39,6 +46,17 @@ declare_mutex(
     out = "epoll_mutex.go",
     package = "vfs",
     prefix = "epoll",
+)
+
+go_template_instance(
+    name = "atomicptr_landlock_domain",
+    out = "atomicptr_landlock_domain_unsafe.go",
+    package = "vfs",
+    suffix = "LandlockDomain",
+    template = "//pkg/sync/atomicptr:generic_atomicptr",
+    types = {
+        "Value": "LandlockDomain",
+    },
 )
 
 go_template_instance(
@@ -131,6 +149,7 @@ go_library(
     name = "vfs",
     srcs = [
         "anonfs.go",
+        "atomicptr_landlock_domain_unsafe.go",
         "context.go",
         "debug_impl.go",
         "debug_testonly.go",
@@ -152,6 +171,7 @@ go_library(
         "inotify_event_mutex.go",
         "inotify_mutex.go",
         "landlock.go",
+        "landlock_ruleset_mutex.go",
         "lock.go",
         "mount.go",
         "mount_list.go",
@@ -213,6 +233,7 @@ go_test(
     size = "small",
     srcs = [
         "file_description_impl_util_test.go",
+        "landlock_test.go",
         "mount_test.go",
         "posix_acl_test.go",
     ],

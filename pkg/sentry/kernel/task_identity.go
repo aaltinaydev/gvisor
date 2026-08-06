@@ -487,18 +487,17 @@ func (t *Task) GetNoNewPrivs() bool {
 	return t.noNewPrivs
 }
 
-// LandlockDomain returns t's Landlock domain.
+// LandlockDomain returns t's Landlock domain, or nil if t is not sandboxed. It
+// may be called from any goroutine.
 func (t *Task) LandlockDomain() *vfs.LandlockDomain {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.landlockDomain
+	return t.landlockDomain.Load()
 }
 
 // SetLandlockDomain sets t's Landlock domain.
+//
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) SetLandlockDomain(domain *vfs.LandlockDomain) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.landlockDomain = domain
+	t.landlockDomain.Store(domain)
 }
 
 // AmbientCapability returns whether the capability cp is in the ambient set.

@@ -14,6 +14,10 @@
 
 package linux
 
+import (
+	"structs"
+)
+
 // Landlock create_ruleset flags.
 // Matches Linux [include/uapi/linux/landlock.h]:landlock_create_ruleset_flags
 const (
@@ -71,6 +75,11 @@ const (
 		LANDLOCK_ACCESS_FS_MAKE_BLOCK |
 		LANDLOCK_ACCESS_FS_MAKE_SYM
 
+	// LANDLOCK_ACCESS_FS_FILE_MASK mirrors the kernel constant, so it includes
+	// TRUNCATE (ABI v3) and IOCTL_DEV (ABI v5). Those bits are unreachable
+	// while only ABI v1 is implemented, because a ruleset's handled rights are
+	// validated against LANDLOCK_ACCESS_FS_V1 and a rule's allowed rights are
+	// in turn validated against the ruleset's.
 	LANDLOCK_ACCESS_FS_FILE_MASK = LANDLOCK_ACCESS_FS_EXECUTE |
 		LANDLOCK_ACCESS_FS_WRITE_FILE |
 		LANDLOCK_ACCESS_FS_READ_FILE |
@@ -80,7 +89,11 @@ const (
 
 // LandlockRulesetAttr is the argument of sys_landlock_create_ruleset().
 // Matches Linux [include/uapi/linux/landlock.h]:struct landlock_ruleset_attr
+//
+// +marshal
 type LandlockRulesetAttr struct {
+	_ structs.HostLayout
+
 	HandledAccessFS  uint64
 	HandledAccessNet uint64
 	Scoped           uint64
@@ -88,14 +101,25 @@ type LandlockRulesetAttr struct {
 
 // LandlockPathBeneathAttr is the argument of sys_landlock_add_rule() for LANDLOCK_RULE_PATH_BENEATH.
 // Matches Linux [include/uapi/linux/landlock.h]:struct landlock_path_beneath_attr
+//
+// The Linux struct is __attribute__((packed)), so it is 12 bytes rather than
+// the 16 that Go's alignment rules give it. ParentFD is tagged unaligned so
+// that the 4 bytes of implicit trailing padding are left out of the marshalled
+// form, which is therefore 12 bytes and matches Linux.
+//
+// +marshal
 type LandlockPathBeneathAttr struct {
+	_ structs.HostLayout
+
 	AllowedAccess uint64
-	ParentFD      int32
+	ParentFD      int32 `marshal:"unaligned"`
 }
 
 // LandlockNetPortAttr is the argument of sys_landlock_add_rule() for LANDLOCK_RULE_NET_PORT.
 // Matches Linux [include/uapi/linux/landlock.h]:struct landlock_net_port_attr
 type LandlockNetPortAttr struct {
+	_ structs.HostLayout
+
 	AllowedAccess uint64
 	Port          uint64
 }

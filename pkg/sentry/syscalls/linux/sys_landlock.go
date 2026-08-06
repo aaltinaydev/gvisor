@@ -38,6 +38,11 @@ func LandlockCreateRuleset(t *kernel.Task, sysno uintptr, args arch.SyscallArgum
 			return uintptr(linux.LandlockAbiVersion), nil, nil
 		}
 		if flags == linux.LANDLOCK_CREATE_RULESET_ERRATA {
+			// The return value is a bitmask of the errata that this
+			// implementation has fixed. We report none: userspace that consults
+			// it then assumes the unfixed behaviour, which is the conservative
+			// direction. Linux reports errata that only apply to ABI versions
+			// above the one we implement.
 			return 0, nil, nil
 		}
 		return 0, nil, linuxerr.EINVAL
@@ -53,31 +58,28 @@ func LandlockCreateRuleset(t *kernel.Task, sysno uintptr, args arch.SyscallArgum
 		return 0, nil, linuxerr.E2BIG
 	}
 
+	// Userspace may pass a struct shorter than the one we know about, in which
+	// case the missing trailing fields are treated as zero.
+	//
 	// Matches Linux [security/landlock/syscalls.c]:copy_min_struct_from_user()
 	var attr linux.LandlockRulesetAttr
+	attrSize := uint(attr.SizeBytes())
 	copySize := size
-	if copySize > 24 {
-		copySize = 24
+	if copySize > attrSize {
+		copySize = attrSize
 	}
 
-	buf := make([]byte, copySize)
-	if _, err := t.CopyInBytes(attrAddr, buf); err != nil {
+	buf := make([]byte, attrSize)
+	if _, err := t.CopyInBytes(attrAddr, buf[:copySize]); err != nil {
 		return 0, nil, linuxerr.EFAULT
 	}
+	attr.UnmarshalBytes(buf)
 
-	if copySize >= 8 {
-		attr.HandledAccessFS = hostarch.ByteOrder.Uint64(buf[0:8])
-	}
-	if copySize >= 16 {
-		attr.HandledAccessNet = hostarch.ByteOrder.Uint64(buf[8:16])
-	}
-	if copySize >= 24 {
-		attr.Scoped = hostarch.ByteOrder.Uint64(buf[16:24])
-	}
-
-	if size > 24 {
-		extraBuf := make([]byte, size-24)
-		if _, err := t.CopyInBytes(attrAddr+24, extraBuf); err != nil {
+	// A struct longer than the one we know about is only acceptable if the
+	// trailing bytes are all zero.
+	if size > attrSize {
+		extraBuf := make([]byte, size-attrSize)
+		if _, err := t.CopyInBytes(attrAddr+hostarch.Addr(attrSize), extraBuf); err != nil {
 			return 0, nil, linuxerr.EFAULT
 		}
 		for _, b := range extraBuf {
@@ -93,10 +95,12 @@ func LandlockCreateRuleset(t *kernel.Task, sysno uintptr, args arch.SyscallArgum
 	if attr.HandledAccessFS == 0 {
 		return 0, nil, linuxerr.ENOMSG
 	}
-	if size >= 16 && attr.HandledAccessNet != 0 {
+	// Fields absent from a short struct were zero-filled above, so these reject
+	// only rights the caller actually asked for.
+	if attr.HandledAccessNet != 0 {
 		return 0, nil, linuxerr.EINVAL
 	}
-	if size >= 24 && attr.Scoped != 0 {
+	if attr.Scoped != 0 {
 		return 0, nil, linuxerr.EINVAL
 	}
 
@@ -147,12 +151,9 @@ func LandlockAddRule(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) 
 	}
 
 	var attr linux.LandlockPathBeneathAttr
-	buf := make([]byte, 12)
-	if _, err := t.CopyInBytes(ruleAttrAddr, buf); err != nil {
+	if _, err := attr.CopyIn(t, ruleAttrAddr); err != nil {
 		return 0, nil, linuxerr.EFAULT
 	}
-	attr.AllowedAccess = hostarch.ByteOrder.Uint64(buf[0:8])
-	attr.ParentFD = int32(hostarch.ByteOrder.Uint32(buf[8:12]))
 
 	if attr.AllowedAccess == 0 {
 		return 0, nil, linuxerr.ENOMSG

@@ -474,8 +474,12 @@ type Task struct {
 
 	// landlockDomain is the task's Landlock domain.
 	//
-	// landlockDomain is protected by mu.
-	landlockDomain *vfs.LandlockDomain
+	// landlockDomain is owned by the task goroutine. All vfs.LandlockDomain
+	// objects that landlockDomain may point to, or have pointed to in the past,
+	// must be treated as immutable: a domain is only ever replaced, never
+	// modified in place. It is stored atomically because it is read from other
+	// goroutines, including from contexts that hold mu.
+	landlockDomain vfs.AtomicPtrLandlockDomain
 
 	// utsns is the task's UTS namespace.
 	//
