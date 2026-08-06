@@ -37,14 +37,12 @@ namespace testing {
 namespace {
 
 TEST(LandlockV1Test, AbiVersionIsSupported) {
-  SKIP_IF(IsRunningOnGvisor());
   int version = LandlockAbiVersion();
   SKIP_IF(version < 0 && errno == ENOSYS);
   ASSERT_GE(version, 1) << "unexpected Landlock ABI version";
 }
 
 TEST(LandlockV1Test, CreateRulesetHandlingAllV1RightsSucceeds) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   landlock_ruleset_attr attr = {};
   attr.handled_access_fs = kFsAccessV1;
@@ -56,7 +54,6 @@ TEST(LandlockV1Test, CreateRulesetHandlingAllV1RightsSucceeds) {
 }
 
 TEST(LandlockV1Test, CreateRulesetRejectsUnknownFlags) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   landlock_ruleset_attr attr = {};
   attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
@@ -65,7 +62,6 @@ TEST(LandlockV1Test, CreateRulesetRejectsUnknownFlags) {
 }
 
 TEST(LandlockV1Test, CreateRulesetRejectsUnknownAccessBits) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   landlock_ruleset_attr attr = {};
   attr.handled_access_fs = (1ULL << 63);
@@ -74,7 +70,6 @@ TEST(LandlockV1Test, CreateRulesetRejectsUnknownAccessBits) {
 }
 
 TEST(LandlockV1Test, AddRuleRejectsUnknownRuleType) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   landlock_ruleset_attr attr = {};
   attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
@@ -88,7 +83,6 @@ TEST(LandlockV1Test, AddRuleRejectsUnknownRuleType) {
 }
 
 TEST(LandlockV1Test, AddPathBeneathRejectsUnhandledAccess) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   struct landlock_ruleset_attr attr = {};
@@ -108,7 +102,6 @@ TEST(LandlockV1Test, AddPathBeneathRejectsUnhandledAccess) {
 }
 
 TEST(LandlockV1Test, RestrictSelfWithoutNoNewPrivsFails) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
     struct landlock_ruleset_attr attr = {};
@@ -124,7 +117,6 @@ TEST(LandlockV1Test, RestrictSelfWithoutNoNewPrivsFails) {
 }
 
 TEST(LandlockV1Test, RestrictSelfRejectsBadFd) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -137,7 +129,6 @@ TEST(LandlockV1Test, RestrictSelfRejectsBadFd) {
 }
 
 TEST(LandlockV1Test, ReadOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -159,7 +150,6 @@ TEST(LandlockV1Test, ReadOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, ReadInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -179,7 +169,6 @@ TEST(LandlockV1Test, ReadInsideAllowedTreeAllowed) {
 }
 
 TEST(LandlockV1Test, RestrictionInheritedAcrossFork) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -209,7 +198,6 @@ TEST(LandlockV1Test, RestrictionInheritedAcrossFork) {
 }
 
 TEST(LandlockV1Test, LayeredRulesetsOnlyIntersect) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -231,7 +219,6 @@ TEST(LandlockV1Test, LayeredRulesetsOnlyIntersect) {
 }
 
 TEST(LandlockV1Test, WriteFileOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -257,7 +244,6 @@ TEST(LandlockV1Test, WriteFileOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, WriteFileInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -281,7 +267,6 @@ TEST(LandlockV1Test, WriteFileInsideAllowedTreeAllowed) {
 }
 
 TEST(LandlockV1Test, ReadDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -307,7 +292,6 @@ TEST(LandlockV1Test, ReadDirOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, MakeRegOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -331,7 +315,6 @@ TEST(LandlockV1Test, MakeRegOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, MakeRegInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -353,7 +336,6 @@ TEST(LandlockV1Test, MakeRegInsideAllowedTreeAllowed) {
 }
 
 TEST(LandlockV1Test, MakeDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -373,7 +355,6 @@ TEST(LandlockV1Test, MakeDirOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, RemoveFileOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -395,7 +376,6 @@ TEST(LandlockV1Test, RemoveFileOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, RemoveFileInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -415,7 +395,6 @@ TEST(LandlockV1Test, RemoveFileInsideAllowedTreeAllowed) {
 }
 
 TEST(LandlockV1Test, RemoveDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -437,7 +416,6 @@ TEST(LandlockV1Test, RemoveDirOutsideAllowedTreeDenied) {
 }
 
 TEST(LandlockV1Test, RemoveDirInsideAllowedTreeAllowed) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -457,7 +435,6 @@ TEST(LandlockV1Test, RemoveDirInsideAllowedTreeAllowed) {
 }
 
 TEST(LandlockV1Test, ExecuteOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
 
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
