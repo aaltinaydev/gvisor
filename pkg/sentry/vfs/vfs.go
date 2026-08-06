@@ -360,6 +360,18 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 	// also honored." - mkdir(2)
 	opts.Mode &= 0777 | linux.S_ISVTX
 
+	// Landlock enforcement: Check if active Landlock domain restricts directory creation (LANDLOCK_ACCESS_FS_MAKE_DIR) in the parent directory to enforce path-based access control.
+	if domain := LandlockDomainFromContext(ctx); domain != nil {
+		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+		if err == nil {
+			err := domain.CheckAccess(ctx, vfs, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_DIR)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
@@ -395,6 +407,29 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 	if pop.FollowFinalSymlink {
 		ctx.Warningf("VirtualFilesystem.MknodAt: file creation paths can't follow final symlink")
 		return linuxerr.EINVAL
+	}
+
+	// Landlock enforcement: Check if active Landlock domain restricts node creation (LANDLOCK_ACCESS_FS_MAKE_*) in the parent directory based on node type to enforce path-based access control.
+	if domain := LandlockDomainFromContext(ctx); domain != nil {
+		accessRight := uint64(linux.LANDLOCK_ACCESS_FS_MAKE_REG)
+		switch opts.Mode.FileType() {
+		case linux.S_IFCHR:
+			accessRight = linux.LANDLOCK_ACCESS_FS_MAKE_CHAR
+		case linux.S_IFBLK:
+			accessRight = linux.LANDLOCK_ACCESS_FS_MAKE_BLOCK
+		case linux.S_IFIFO:
+			accessRight = linux.LANDLOCK_ACCESS_FS_MAKE_FIFO
+		case linux.S_IFSOCK:
+			accessRight = linux.LANDLOCK_ACCESS_FS_MAKE_SOCK
+		}
+		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+		if err == nil {
+			err := domain.CheckAccess(ctx, vfs, parentVD, accessRight)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	rp := vfs.getResolvingPath(creds, pop)
@@ -488,6 +523,36 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 				if stat.Mask&linux.STATX_TYPE == 0 || stat.Mode&linux.S_IFMT != linux.S_IFREG {
 					fd.DecRef(ctx)
 					return nil, linuxerr.EACCES
+				}
+			}
+
+			// Landlock enforcement: Check if active Landlock domain restricts file opening or execution (LANDLOCK_ACCESS_FS_*) on target path to enforce path-based access control.
+			if domain := LandlockDomainFromContext(ctx); domain != nil {
+				accessRight := uint64(linux.LANDLOCK_ACCESS_FS_READ_FILE)
+				stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
+				isDir := false
+				if err == nil && stat.Mask&linux.STATX_TYPE != 0 && stat.Mode&linux.S_IFMT == linux.S_IFDIR {
+					isDir = true
+				}
+				if opts.FileExec {
+					accessRight = linux.LANDLOCK_ACCESS_FS_EXECUTE
+				} else if opts.Flags&linux.O_DIRECTORY != 0 || isDir {
+					accessRight = linux.LANDLOCK_ACCESS_FS_READ_DIR
+				} else if opts.Flags&(linux.O_WRONLY|linux.O_RDWR) != 0 {
+					accessRight = linux.LANDLOCK_ACCESS_FS_WRITE_FILE
+				}
+				if err := domain.CheckAccess(ctx, vfs, fd.VirtualDentry(), accessRight); err != nil {
+					fd.DecRef(ctx)
+					return nil, err
+				}
+				if fd.IsCreated() {
+					targetPath, err := vfs.PathnameWithDeleted(ctx, VirtualDentry{}, fd.VirtualDentry())
+					if err == nil {
+						if err := domain.CheckAccessPath(path.Dir(targetPath), linux.LANDLOCK_ACCESS_FS_MAKE_REG); err != nil {
+							fd.DecRef(ctx)
+							return nil, err
+						}
+					}
 				}
 			}
 
@@ -603,6 +668,18 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
 		return linuxerr.EINVAL
 	}
 
+	// Landlock enforcement: Check if active Landlock domain restricts directory removal (LANDLOCK_ACCESS_FS_REMOVE_DIR) on parent directory to enforce path-based access control.
+	if domain := LandlockDomainFromContext(ctx); domain != nil {
+		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+		if err == nil {
+			err := domain.CheckAccess(ctx, vfs, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
@@ -699,6 +776,18 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 		return linuxerr.EINVAL
 	}
 
+	// Landlock enforcement: Check if active Landlock domain restricts symlink creation (LANDLOCK_ACCESS_FS_MAKE_SYM) in parent directory to enforce path-based access control.
+	if domain := LandlockDomainFromContext(ctx); domain != nil {
+		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+		if err == nil {
+			err := domain.CheckAccess(ctx, vfs, parentVD, linux.LANDLOCK_ACCESS_FS_MAKE_SYM)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
@@ -733,6 +822,18 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 	if pop.FollowFinalSymlink {
 		ctx.Warningf("VirtualFilesystem.UnlinkAt: file deletion paths can't follow final symlink")
 		return linuxerr.EINVAL
+	}
+
+	// Landlock enforcement: Check if active Landlock domain restricts file removal (LANDLOCK_ACCESS_FS_REMOVE_FILE) on parent directory to enforce path-based access control.
+	if domain := LandlockDomainFromContext(ctx); domain != nil {
+		parentVD, _, err := vfs.getParentDirAndName(ctx, creds, pop)
+		if err == nil {
+			err := domain.CheckAccess(ctx, vfs, parentVD, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
+			parentVD.DecRef(ctx)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	rp := vfs.getResolvingPath(creds, pop)

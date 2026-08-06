@@ -25,6 +25,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/syscalls/linux/landlock_util.h"
+#include "test/util/capability_util.h"
 #include "test/util/fs_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
@@ -103,6 +104,7 @@ TEST(LandlockV1Test, AddPathBeneathRejectsUnhandledAccess) {
 
 TEST(LandlockV1Test, RestrictSelfWithoutNoNewPrivsFails) {
   SKIP_IF(LandlockAbiVersion() < 1);
+  AutoCapability cap_admin(CAP_SYS_ADMIN, false);
   int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
     struct landlock_ruleset_attr attr = {};
     attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
