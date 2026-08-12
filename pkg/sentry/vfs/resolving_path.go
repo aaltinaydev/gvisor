@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -56,6 +57,8 @@ type ResolvingPath struct {
 	nextMount        *Mount  // ref held if not nil
 	nextStart        *Dentry // ref held if not nil
 	absSymlinkTarget fspath.Path
+
+	toDecRef []refs.RefCounter `state:"nosave"`
 
 	// ResolvingPath tracks relative paths, which is updated whenever a relative
 	// symlink is encountered.
@@ -152,6 +155,7 @@ func (rp *ResolvingPath) Copy() *ResolvingPath {
 	// Reset error state.
 	copy.nextStart = nil
 	copy.nextMount = nil
+	copy.toDecRef = nil
 	return copy
 }
 
@@ -162,6 +166,10 @@ func (rp *ResolvingPath) Release(ctx context.Context) {
 	rp.mount = nil
 	rp.start = nil
 	rp.releaseErrorState(ctx)
+	for _, ref := range rp.toDecRef {
+		ref.DecRef(ctx)
+	}
+	rp.toDecRef = nil
 	resolvingPathPool.Put(rp)
 }
 
@@ -289,7 +297,7 @@ func (rp *ResolvingPath) CheckRoot(ctx context.Context, d *Dentry) (bool, error)
 		return true, nil
 	} else if d == rp.mount.root {
 		// At mount root ...
-		vd := rp.vfs.getMountpointAt(ctx, rp.mount, rp.root)
+		vd := rp.vfs.getMountpointAt(ctx, rp.mount, rp.root, nil)
 		if vd.Ok() {
 			// ... of non-root mount.
 			rp.nextMount = vd.mount

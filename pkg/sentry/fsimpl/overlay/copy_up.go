@@ -416,6 +416,8 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		d.lowerMappings.RemoveAll()
 	}
 
+	d.fs.recordCopyUpIdentityOrigin(d.lowerVDs[0].Dentry().InodeIdentity(), d.upperVD.Dentry().InodeIdentity())
+
 	d.copiedUp.Store(1)
 	return nil
 }

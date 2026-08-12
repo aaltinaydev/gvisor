@@ -428,6 +428,10 @@ func PivotRoot(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	}
 	defer putOldTpop.Release(t)
 
+	if err := t.Kernel().VFS().CheckLandlockMountAt(t, t.Credentials(), &newRootTpop.pop, &putOldTpop.pop); err != nil {
+		return 0, nil, err
+	}
+
 	newRoot, oldRoot, err := t.Kernel().VFS().PivotRoot(t, t.Credentials(), &newRootTpop.pop, &putOldTpop.pop)
 	if err != nil {
 		return 0, nil, err

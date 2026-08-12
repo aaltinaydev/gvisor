@@ -131,6 +131,18 @@ func (i *inode) GID() auth.KGID {
 	return auth.KGID(i.gid.Load())
 }
 
+func (i *inode) DevMajor() uint32 {
+	return linux.UNNAMED_MAJOR
+}
+
+func (i *inode) DevMinor() uint32 {
+	return i.fs.devMinor
+}
+
+func (i *inode) Ino() uint64 {
+	return i.nodeID
+}
+
 // +checklocks:i.attrMu
 func (i *inode) filemode() linux.FileMode {
 	return linux.FileMode(i.mode.Load())

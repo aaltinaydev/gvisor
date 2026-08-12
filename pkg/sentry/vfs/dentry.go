@@ -130,6 +130,8 @@ type DentryImpl interface {
 	// The caller does not need to hold a reference on the dentry.
 	Watches() *Watches
 
+	InodeIdentity() InodeIdentity
+
 	// OnZeroWatches is called whenever the number of watches on a dentry drops
 	// to zero. This is needed by some FilesystemImpls (e.g. gofer) to manage
 	// dentry lifetime.

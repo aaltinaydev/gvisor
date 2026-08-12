@@ -60,6 +60,7 @@ struct landlock_net_port_attr {
 };
 
 constexpr uint32_t LANDLOCK_CREATE_RULESET_VERSION = (1U << 0);
+constexpr uint32_t LANDLOCK_CREATE_RULESET_ERRATA = (1U << 1);
 
 // Filesystem access rights.
 constexpr uint64_t LANDLOCK_ACCESS_FS_EXECUTE = (1ULL << 0);      // v1
@@ -134,6 +135,15 @@ inline int LandlockAbiVersion() {
   return landlock_create_ruleset(nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
 }
 
+inline bool LandlockErratumFixed(int number) {
+  int errata = landlock_create_ruleset(nullptr, 0,
+                                       LANDLOCK_CREATE_RULESET_ERRATA);
+  if (errata < 0) {
+    return false;
+  }
+  return (errata & (1 << (number - 1))) != 0;
+}
+
 inline int CreateRuleset(uint64_t handled_fs, uint64_t handled_net = 0,
                          uint64_t scoped = 0) {
   landlock_ruleset_attr attr = {};
@@ -188,6 +198,10 @@ inline void ApplyFsPolicy(uint64_t handled_access,
   int fd = CreateRuleset(handled_access);
   AddPathRule(fd, allowed_path, allowed_access);
   EnforceOrDie(fd);
+}
+
+inline void ApplyFsPolicyDenyingAll(uint64_t handled_access) {
+  EnforceOrDie(CreateRuleset(handled_access));
 }
 
 inline ChildResult ClassifyFs(int rc) {
