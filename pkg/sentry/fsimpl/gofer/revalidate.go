@@ -196,6 +196,15 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp resolvingPath, d *d
 }
 
 // Precondition: fs.renameMu must be locked.
+//
+// Invalidation deliberately does not retire d's inode number the way
+// unlinkAt() does via releaseInoOnDeletion(): a dentry is invalidated when
+// revalidation finds the host file changed underneath an InteropModeShared
+// mount, and the sentry cannot tell a deletion apart from a rename it never
+// observed, where the number must survive. A host-side delete and recreate
+// reusing the host inode key can therefore let a Landlock rule added for the
+// old file grant access to the new one; this is the syscall table's
+// documented caveat for shared mounts.
 func (d *dentry) invalidate(ctx context.Context, vfsObj *vfs.VirtualFilesystem, ds **[]*dentry) {
 	// Remove d from its parent.
 	removed := func() bool {

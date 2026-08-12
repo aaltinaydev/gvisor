@@ -428,6 +428,16 @@ func PivotRoot(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	}
 	defer putOldTpop.Release(t)
 
+	// Landlock denies pivot_root(2) outright, once both paths have been
+	// resolved: a path that cannot be looked up is reported as such.
+	//
+	// Matches Linux [fs/namespace.c]:path_pivot_root(), which calls
+	// security_sb_pivotroot() after SYSCALL_DEFINE2(pivot_root, ...) has
+	// resolved both paths.
+	if err := t.Kernel().VFS().CheckLandlockMountAt(t, t.Credentials(), &newRootTpop.pop, &putOldTpop.pop); err != nil {
+		return 0, nil, err
+	}
+
 	newRoot, oldRoot, err := t.Kernel().VFS().PivotRoot(t, t.Credentials(), &newRootTpop.pop, &putOldTpop.pop)
 	if err != nil {
 		return 0, nil, err

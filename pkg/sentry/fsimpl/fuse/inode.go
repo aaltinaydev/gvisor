@@ -131,6 +131,23 @@ func (i *inode) GID() auth.KGID {
 	return auth.KGID(i.gid.Load())
 }
 
+// DevMajor identifies i's filesystem for kernfs.Dentry.InodeIdentity.
+func (i *inode) DevMajor() uint32 {
+	return linux.UNNAMED_MAJOR
+}
+
+// DevMinor identifies i's filesystem for kernfs.Dentry.InodeIdentity.
+func (i *inode) DevMinor() uint32 {
+	return i.fs.devMinor
+}
+
+// Ino identifies i for kernfs.Dentry.InodeIdentity. It returns the immutable
+// nodeID rather than the mutable i.ino, matching getFUSEAttr(); the server
+// assigns one nodeID per file, so hard links to a file share it.
+func (i *inode) Ino() uint64 {
+	return i.nodeID
+}
+
 // +checklocks:i.attrMu
 func (i *inode) filemode() linux.FileMode {
 	return linux.FileMode(i.mode.Load())

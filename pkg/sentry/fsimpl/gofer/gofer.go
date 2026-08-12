@@ -1644,6 +1644,16 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+// InodeIdentity implements vfs.DentryImpl.InodeIdentity.
+//
+// inode.ino is used rather than inode.inoKey because it is unique for synthetic
+// inodes, which have no inoKey, while still being shared between dentries that
+// are hard links to the same remote file: fs.inoFromKey() assigns one ino per
+// inoKey.
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	return vfs.MakeInodeIdentity(&d.inode.fs.vfsfs, linux.UNNAMED_MAJOR, d.inode.fs.devMinor, d.inode.ino)
+}
+
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 //
 // If no watches are left on this dentry and it has no references, cache it.
@@ -1927,8 +1937,12 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.inode.refs.DecRef(func() {
 		destroyInode = true
 		if !d.isDir() {
-			// Only non-directory inodes are cached in inodeByKey.
-			delete(d.inode.fs.inodeByKey, d.inode.inoKey)
+			// Only non-directory inodes are cached in inodeByKey. The entry is
+			// compared first: releaseInoOnDeletion() may already have retired
+			// this inode's key, and a new file may hold it by now.
+			if cached, ok := d.inode.fs.inodeByKey[d.inode.inoKey]; ok && cached == d.inode {
+				delete(d.inode.fs.inodeByKey, d.inode.inoKey)
+			}
 		}
 	})
 	d.inode.fs.inodeMu.Unlock()
@@ -1956,6 +1970,57 @@ func (d *dentry) isDeleted() bool {
 
 func (d *dentry) setDeleted() {
 	d.deleted.Store(1)
+}
+
+// releaseInoOnDeletion retires the sentry inode number minted for d's file
+// once no link to the file remains, by dropping the file's host inode key
+// from fs.inoByKey and fs.inodeByKey. The host is free to hand the key out
+// again for a file it creates later; without this, that file would inherit
+// the deleted file's inode number, and with it the reach of any Landlock
+// rule keyed by the deleted file's identity, where a rule on Linux dies with
+// the inode it holds. (It would also inherit a misleading st_ino, which
+// pre-dates Landlock and is harmless by comparison.)
+//
+// The caller must have called d.setDeleted() and, for a removed name,
+// d.decLinks() first: a regular file reached by other hard links keeps its
+// number, since the surviving links still name the same file. A remote
+// filesystem that does not report link counts leaves nlink untracked at
+// zero, so its files retire their number on the first unlink; that can only
+// change the st_ino a surviving link reports after its dentry is evicted,
+// which is already not preserved across checkpoint/restore.
+//
+// Deletions the sentry never observes — a file removed on the host behind an
+// InteropModeShared mount — cannot be handled here and remain the documented
+// residual exposure; see pkg/sentry/vfs/g3doc/landlock.md.
+func (d *dentry) releaseInoOnDeletion() {
+	if d.inode.isSynthetic() {
+		// Synthetic inodes take their numbers from fs.nextIno() directly and
+		// are never in the maps.
+		return
+	}
+	if !d.isDir() && d.inode.nlink.Load() > 0 {
+		// Other hard links remain. Directories have no hard links, and their
+		// nlink counts subdirectories, so they retire unconditionally.
+		return
+	}
+	fs := d.inode.fs
+	key := d.inode.inoKey
+	fs.inoMu.Lock()
+	if ino, ok := fs.inoByKey[key]; ok && ino == d.inode.ino {
+		delete(fs.inoByKey, key)
+	}
+	fs.inoMu.Unlock()
+	if !d.isDir() {
+		// Only non-directory inodes are cached in inodeByKey. Remove the
+		// deleted inode so a later file that reuses the key cannot share it;
+		// the entry is compared first because a new file may already have
+		// claimed the key.
+		fs.inodeMu.Lock()
+		if cached, ok := fs.inodeByKey[key]; ok && cached == d.inode {
+			delete(fs.inodeByKey, key)
+		}
+		fs.inodeMu.Unlock()
+	}
 }
 
 func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {

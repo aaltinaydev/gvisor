@@ -588,6 +588,25 @@ func (d *Dentry) Watches() *vfs.Watches {
 	return d.inode.Watches()
 }
 
+// inodeIdentifiable is implemented by Inodes that can identify the file they
+// represent. InodeAttrs implements it, so it is implemented by every inode that
+// tracks its attributes in the generic way. Inodes that do not implement it are
+// anonymous, so no path names them and they need no identity.
+type inodeIdentifiable interface {
+	DevMajor() uint32
+	DevMinor() uint32
+	Ino() uint64
+}
+
+// InodeIdentity implements vfs.DentryImpl.InodeIdentity.
+func (d *Dentry) InodeIdentity() vfs.InodeIdentity {
+	inode, ok := d.inode.(inodeIdentifiable)
+	if !ok {
+		return vfs.InodeIdentity{}
+	}
+	return vfs.MakeInodeIdentity(d.fs.VFSFilesystem(), inode.DevMajor(), inode.DevMinor(), inode.Ino())
+}
+
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
 func (d *Dentry) OnZeroWatches(context.Context) {}
 
