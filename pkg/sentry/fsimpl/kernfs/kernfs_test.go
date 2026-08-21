@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
@@ -568,5 +569,69 @@ func TestRmdirInotifyWithOpenFDDefersDeleteSelf(t *testing.T) {
 	}
 	if diff := cmp.Diff(wantTail, got[len(got)-2:]); diff != "" {
 		t.Fatalf("unexpected trailing inotify events after close (-want +got):\n%s\nall events: %+v", diff, got)
+	}
+}
+
+// TestSyntheticDirectoryLandlockRuleScope checks which directories a Landlock
+// rule added on a synthetic directory applies to. A rule must apply to its
+// target and to everything beneath it, and to nothing else.
+//
+// Synthetic directories are all created with inode number 0, so they share a
+// single vfs.InodeIdentity and rule lookup cannot tell them apart: the rule
+// added on "synth1" below also grants access on the unrelated "synth2". This
+// test documents that behavior; the following commit fixes it and updates the
+// expectations here.
+func TestSyntheticDirectoryLandlockRuleScope(t *testing.T) {
+	sys := newTestSystem(t, func(ctx context.Context, creds *auth.Credentials, fs *filesystem) kernfs.Inode {
+		// readonlyDir rejects NewDir, so MkdirAt falls back to creating
+		// synthetic directories.
+		return fs.newReadonlyDir(ctx, creds, 0755, nil)
+	})
+	defer sys.Destroy()
+
+	mkdirOpts := &vfs.MkdirOptions{Mode: 0755, ForSyntheticMountpoint: true}
+	for _, path := range []string{"synth1", "synth2", "synth1/nested"} {
+		if err := sys.VFS.MkdirAt(sys.Ctx, sys.Creds, sys.PathOpAtRoot(path), mkdirOpts); err != nil {
+			t.Fatalf("MkdirAt(%q) failed: %v", path, err)
+		}
+	}
+
+	// Build a single-layer domain that handles READ_DIR and allows it on
+	// "synth1" only.
+	const accessRights = linux.LANDLOCK_ACCESS_FS_READ_DIR
+	ruleset := vfs.NewLandlockRuleset(accessRights)
+	target := sys.GetDentryOrDie(sys.PathOpAtRoot("synth1"))
+	defer target.DecRef(sys.Ctx)
+	ruleset.InsertRule(target.Dentry().InodeIdentity(), accessRights)
+	var unrestricted *vfs.LandlockDomain
+	domain, err := unrestricted.Merge(ruleset)
+	if err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	for _, tc := range []struct {
+		path        string
+		wantAllowed bool
+	}{
+		// The rule target itself.
+		{"synth1", true},
+		// Beneath the rule target, so allowed by inheritance.
+		{"synth1/nested", true},
+		// Unrelated to the rule target, so this should be denied. It is not:
+		// "synth2" has inode number 0 and hence the same identity as
+		// "synth1", so the rule matches it too.
+		{"synth2", true},
+	} {
+		vd := sys.GetDentryOrDie(sys.PathOpAtRoot(tc.path))
+		var toDecRef []refs.RefCounter
+		err := domain.CheckAccess(sys.Ctx, sys.VFS, vd, accessRights, &toDecRef)
+		for _, rc := range toDecRef {
+			rc.DecRef(sys.Ctx)
+		}
+		vd.DecRef(sys.Ctx)
+
+		if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
+			t.Errorf("CheckAccess(%q): allowed=%v (err=%v), want allowed=%v", tc.path, gotAllowed, err, tc.wantAllowed)
+		}
 	}
 }
