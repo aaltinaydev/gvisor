@@ -39,18 +39,26 @@ type syntheticDirectory struct {
 	syntheticDirectoryRefs
 	InodeFSOwned
 
+	// fs is the owning filesystem. fs is immutable. It is retained so that
+	// nested synthetic directories created by NewDir can allocate inode
+	// numbers.
+	fs *Filesystem
+
 	locks vfs.FileLocks
 }
 
 var _ Inode = (*syntheticDirectory)(nil)
 
-func newSyntheticDirectory(ctx context.Context, creds *auth.Credentials, perm linux.FileMode) Inode {
+func newSyntheticDirectory(ctx context.Context, fs *Filesystem, creds *auth.Credentials, perm linux.FileMode) Inode {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("perm contains non-permission bits: %#o", perm))
 	}
-	dir := &syntheticDirectory{}
+	dir := &syntheticDirectory{fs: fs}
 	dir.InitRefs()
-	dir.InodeAttrs.Init(ctx, creds, 0 /* devMajor */, 0 /* devMinor */, 0 /* ino */, linux.S_IFDIR|perm)
+	// Allocate a real inode number: synthetic directories are otherwise
+	// indistinguishable from one another to anything that identifies files by
+	// (device, inode), such as Landlock rules.
+	dir.InodeAttrs.Init(ctx, creds, 0 /* devMajor */, 0 /* devMinor */, fs.NextIno(), linux.S_IFDIR|perm)
 	dir.OrderedChildren.Init(OrderedChildrenOptions{
 		Writable: true,
 	})
@@ -76,7 +84,7 @@ func (dir *syntheticDirectory) NewDir(ctx context.Context, name string, opts vfs
 	if !opts.ForSyntheticMountpoint {
 		return nil, linuxerr.EPERM
 	}
-	subdirI := newSyntheticDirectory(ctx, auth.CredentialsFromContext(ctx), opts.Mode&linux.PermissionsMask)
+	subdirI := newSyntheticDirectory(ctx, dir.fs, auth.CredentialsFromContext(ctx), opts.Mode&linux.PermissionsMask)
 	if err := dir.OrderedChildren.Insert(name, subdirI); err != nil {
 		subdirI.DecRef(ctx)
 		return nil, err

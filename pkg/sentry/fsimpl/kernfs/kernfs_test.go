@@ -576,11 +576,10 @@ func TestRmdirInotifyWithOpenFDDefersDeleteSelf(t *testing.T) {
 // rule added on a synthetic directory applies to. A rule must apply to its
 // target and to everything beneath it, and to nothing else.
 //
-// Synthetic directories are all created with inode number 0, so they share a
-// single vfs.InodeIdentity and rule lookup cannot tell them apart: the rule
-// added on "synth1" below also grants access on the unrelated "synth2". This
-// test documents that behavior; the following commit fixes it and updates the
-// expectations here.
+// This is a regression test: synthetic directories used to all be created
+// with inode number 0, so they shared a single vfs.InodeIdentity and rule
+// lookup could not tell them apart, which let the rule added on "synth1"
+// below also grant access on the unrelated "synth2".
 func TestSyntheticDirectoryLandlockRuleScope(t *testing.T) {
 	sys := newTestSystem(t, func(ctx context.Context, creds *auth.Credentials, fs *filesystem) kernfs.Inode {
 		// readonlyDir rejects NewDir, so MkdirAt falls back to creating
@@ -617,10 +616,8 @@ func TestSyntheticDirectoryLandlockRuleScope(t *testing.T) {
 		{"synth1", true},
 		// Beneath the rule target, so allowed by inheritance.
 		{"synth1/nested", true},
-		// Unrelated to the rule target, so this should be denied. It is not:
-		// "synth2" has inode number 0 and hence the same identity as
-		// "synth1", so the rule matches it too.
-		{"synth2", true},
+		// Unrelated to the rule target, so denied.
+		{"synth2", false},
 	} {
 		vd := sys.GetDentryOrDie(sys.PathOpAtRoot(tc.path))
 		var toDecRef []refs.RefCounter
@@ -632,6 +629,52 @@ func TestSyntheticDirectoryLandlockRuleScope(t *testing.T) {
 
 		if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
 			t.Errorf("CheckAccess(%q): allowed=%v (err=%v), want allowed=%v", tc.path, gotAllowed, err, tc.wantAllowed)
+		}
+	}
+}
+
+// TestSyntheticDirectoryInodeIdentity is the unit-level counterpart to
+// TestSyntheticDirectoryLandlockRuleScope: synthetic directories must have
+// distinct inode numbers, and hence distinct vfs.InodeIdentity values, so that
+// anything identifying files by that tuple can tell them apart.
+func TestSyntheticDirectoryInodeIdentity(t *testing.T) {
+	sys := newTestSystem(t, func(ctx context.Context, creds *auth.Credentials, fs *filesystem) kernfs.Inode {
+		return fs.newReadonlyDir(ctx, creds, 0755, nil)
+	})
+	defer sys.Destroy()
+
+	opts := &vfs.MkdirOptions{Mode: 0755, ForSyntheticMountpoint: true}
+	paths := []string{"synth1", "synth2", "synth1/nested"}
+	ids := make(map[string]vfs.InodeIdentity)
+	for _, path := range paths {
+		pop := sys.PathOpAtRoot(path)
+		if err := sys.VFS.MkdirAt(sys.Ctx, sys.Creds, pop, opts); err != nil {
+			t.Fatalf("MkdirAt(%q) failed: %v", path, err)
+		}
+		vd := sys.GetDentryOrDie(pop)
+		defer vd.DecRef(sys.Ctx)
+		id := vd.Dentry().InodeIdentity()
+		if !id.Ok() {
+			t.Errorf("%q: InodeIdentity() is not Ok(), want a valid identity", path)
+		}
+		ids[path] = id
+	}
+
+	for i, a := range paths {
+		for _, b := range paths[i+1:] {
+			if ids[a] == ids[b] {
+				t.Errorf("%q and %q have the same InodeIdentity %+v, want distinct identities", a, b, ids[a])
+			}
+		}
+	}
+
+	// The root is a non-synthetic directory; it must not collide either.
+	rootVD := sys.GetDentryOrDie(sys.PathOpAtRoot("/"))
+	defer rootVD.DecRef(sys.Ctx)
+	rootID := rootVD.Dentry().InodeIdentity()
+	for _, path := range paths {
+		if ids[path] == rootID {
+			t.Errorf("%q has the same InodeIdentity as the root %+v", path, rootID)
 		}
 	}
 }

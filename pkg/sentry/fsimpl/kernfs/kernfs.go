@@ -599,6 +599,13 @@ func (d *Dentry) InodeIdentity() vfs.InodeIdentity {
 	if !ok {
 		return vfs.InodeIdentity{}
 	}
+	// Filesystem.NextIno() never returns 0, so an inode number of 0 means the
+	// inode was initialized without one. Such inodes would all share the
+	// identity (fsID, dev, 0) and hence alias each other, so report no
+	// identity rather than an ambiguous one.
+	if inode.Ino() == 0 {
+		return vfs.InodeIdentity{}
+	}
 	return vfs.MakeInodeIdentity(d.fs.VFSFilesystem(), inode.DevMajor(), inode.DevMinor(), inode.Ino())
 }
 

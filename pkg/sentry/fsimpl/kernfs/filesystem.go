@@ -488,7 +488,7 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		if !opts.ForSyntheticMountpoint || linuxerr.Equals(linuxerr.EEXIST, err) {
 			return err
 		}
-		childI = newSyntheticDirectory(ctx, rp.Credentials(), opts.Mode)
+		childI = newSyntheticDirectory(ctx, fs, rp.Credentials(), opts.Mode)
 	}
 	var child Dentry
 	child.Init(fs, childI)
