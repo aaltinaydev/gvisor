@@ -606,6 +606,10 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	return vfs.MakeInodeIdentity(&d.inode.fs.vfsfs, d.inode.ino)
+}
+
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
 func (d *dentry) OnZeroWatches(context.Context) {}
 

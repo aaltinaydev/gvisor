@@ -358,6 +358,10 @@ func (fd *Fd) DoCmdReconfigure(ctx context.Context, vfsObj *vfs.VirtualFilesyste
 		return linuxerr.EPERM
 	}
 
+	if err := vfs.CheckLandlockMount(vfs.LandlockDomainFromCredentials(auth.CredentialsFromContext(ctx))); err != nil {
+		return err
+	}
+
 	// TODO(gvisor.dev/issues/13450): properly support reconfiguration on underlying filesystems.
 
 	return nil

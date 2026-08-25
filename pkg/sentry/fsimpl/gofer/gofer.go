@@ -252,6 +252,16 @@ type filesystem struct {
 	// using atomic memory operations.
 	lastIno atomicbitops.Uint64
 
+	// pinnedDentries contains dentries pinned by PinInodeIdentity because a
+	// Landlock rule refers to their inode identity. Each pinned dentry holds
+	// one reference, keeping it (and hence its sentry inode number) alive
+	// across dentry cache eviction and checkpoint/restore, analogously to how
+	// Linux's landlock_object holds an inode reference. Pins on deleted
+	// dentries are dropped in PrepareSave; remaining pins are dropped in
+	// Release. pinnedDentries is protected by pinnedDentriesMu.
+	pinnedDentriesMu sync.Mutex `state:"nosave"`
+	pinnedDentries   map[*dentry]struct{}
+
 	// savedDentryRW records open read/write handles during save/restore.
 	savedDentryRW map[*dentry]savedDentryRW
 
@@ -762,6 +772,14 @@ func (fs *filesystem) Release(ctx context.Context) {
 	// destructors. fs.root may be nil if creating the client or initializing the
 	// root dentry failed in GetFilesystem.
 	if refs.GetLeakMode() != refs.NoLeakChecking && fs.root != nil {
+		fs.pinnedDentriesMu.Lock()
+		pinned := fs.pinnedDentries
+		fs.pinnedDentries = nil
+		fs.pinnedDentriesMu.Unlock()
+		for d := range pinned {
+			d.DecRef(ctx)
+		}
+
 		fs.renameMu.Lock()
 		fs.root.releaseExtraRefsRecursiveLocked(ctx)
 		fs.evictAllCachedDentriesLocked(ctx)
@@ -1644,6 +1662,48 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	return vfs.MakeInodeIdentity(&d.inode.fs.vfsfs, d.inode.ino)
+}
+
+// PinInodeIdentity implements the vfs identity pinner interface. It keeps d
+// alive so that d's sentry inode number, to which a Landlock rule is now
+// tied, is not lost to dentry cache eviction (in particular the eviction of
+// all cached dentries in PrepareSave) and reallocated to a different file
+// after a lookup miss.
+func (d *dentry) PinInodeIdentity() {
+	fs := d.inode.fs
+	fs.pinnedDentriesMu.Lock()
+	defer fs.pinnedDentriesMu.Unlock()
+	if _, ok := fs.pinnedDentries[d]; ok {
+		return
+	}
+	if fs.pinnedDentries == nil {
+		fs.pinnedDentries = make(map[*dentry]struct{})
+	}
+	d.IncRef()
+	fs.pinnedDentries[d] = struct{}{}
+}
+
+// releaseDeadPinnedDentries drops pins on deleted dentries. Their rules can
+// never match a path walk again (releaseInoOnDeletion has already retired
+// the sentry inode number), so there is no reason to keep them alive, save
+// them, or recreate their files on restore.
+func (fs *filesystem) releaseDeadPinnedDentries(ctx context.Context) {
+	fs.pinnedDentriesMu.Lock()
+	var dead []*dentry
+	for d := range fs.pinnedDentries {
+		if d.vfsd.IsDead() {
+			delete(fs.pinnedDentries, d)
+			dead = append(dead, d)
+		}
+	}
+	fs.pinnedDentriesMu.Unlock()
+	for _, d := range dead {
+		d.DecRef(ctx)
+	}
+}
+
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 //
 // If no watches are left on this dentry and it has no references, cache it.
@@ -1927,8 +1987,9 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.inode.refs.DecRef(func() {
 		destroyInode = true
 		if !d.isDir() {
-			// Only non-directory inodes are cached in inodeByKey.
-			delete(d.inode.fs.inodeByKey, d.inode.inoKey)
+			if cached, ok := d.inode.fs.inodeByKey[d.inode.inoKey]; ok && cached == d.inode {
+				delete(d.inode.fs.inodeByKey, d.inode.inoKey)
+			}
 		}
 	})
 	d.inode.fs.inodeMu.Unlock()
@@ -1956,6 +2017,29 @@ func (d *dentry) isDeleted() bool {
 
 func (d *dentry) setDeleted() {
 	d.deleted.Store(1)
+}
+
+func (d *dentry) releaseInoOnDeletion() {
+	if d.inode.isSynthetic() {
+		return
+	}
+	if !d.isDir() && d.inode.nlink.Load() > 0 {
+		return
+	}
+	fs := d.inode.fs
+	key := d.inode.inoKey
+	fs.inoMu.Lock()
+	if ino, ok := fs.inoByKey[key]; ok && ino == d.inode.ino {
+		delete(fs.inoByKey, key)
+	}
+	fs.inoMu.Unlock()
+	if !d.isDir() {
+		fs.inodeMu.Lock()
+		if cached, ok := fs.inodeByKey[key]; ok && cached == d.inode {
+			delete(fs.inodeByKey, key)
+		}
+		fs.inodeMu.Unlock()
+	}
 }
 
 func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {

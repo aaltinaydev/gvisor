@@ -21,6 +21,19 @@ import (
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
 
+type LandlockDomain interface {
+	IsLandlockDomain()
+
+	ScopeLE(other LandlockDomain) bool
+}
+
+func LandlockCanPtrace(tracer, tracee LandlockDomain) bool {
+	if tracer == nil {
+		return true
+	}
+	return tracer.ScopeLE(tracee)
+}
+
 // Credentials contains information required to authorize privileged operations
 // in a user namespace.
 //
@@ -58,6 +71,8 @@ type Credentials struct {
 
 	// The user namespace associated with the owner of the credentials.
 	UserNamespace *UserNamespace
+
+	LandlockDomain LandlockDomain
 }
 
 // NewAnonymousCredentials returns a set of credentials with no capabilities in

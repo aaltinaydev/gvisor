@@ -166,6 +166,21 @@ func AccessTypesForOpenFlags(opts *OpenOptions) AccessTypes {
 	}
 }
 
+func CheckOpenFileType(mode linux.FileMode, opts *OpenOptions) error {
+	switch mode.FileType() {
+	case linux.S_IFLNK:
+		return linuxerr.ELOOP
+	case linux.S_IFDIR:
+		if opts.Flags&linux.O_CREAT != 0 {
+			return linuxerr.EISDIR
+		}
+		if AccessTypesForOpenFlags(opts).MayWrite() {
+			return linuxerr.EISDIR
+		}
+	}
+	return nil
+}
+
 // MayReadFileWithOpenFlags returns true if a file with the given open flags
 // should be readable.
 func MayReadFileWithOpenFlags(flags uint32) bool {

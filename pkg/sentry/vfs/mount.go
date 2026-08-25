@@ -141,6 +141,8 @@ type Mount struct {
 	// namespace. It is analogous to MNT_LOCKED in Linux.
 	locked bool
 
+	internal bool
+
 	// lockedFlags contains the flags that RemountAt may not clear. lockedFlags
 	// is protected by VirtualFilesystem.mountMu.
 	lockedFlags mountLockFlags
@@ -161,6 +163,7 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 		root:     root,
 		ns:       mntns,
 		locked:   opts.Locked,
+		internal: opts.InternalMount,
 		isShared: false,
 		refs:     atomicbitops.FromInt64(1),
 	}
@@ -895,6 +898,10 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 		return linuxerr.EINVAL
 	}
 
+	if err := CheckLandlockMount(LandlockDomainFromCredentials(creds)); err != nil {
+		return err
+	}
+
 	if opts.Flags&linux.MNT_DETACH == 0 && vfs.arePropMountsBusy(vd.mount) {
 		return linuxerr.EBUSY
 	}
@@ -1334,7 +1341,14 @@ func (vfs *VirtualFilesystem) getMountpoint(ctx context.Context, creds *auth.Cre
 // Preconditions:
 //   - References are held on mnt and root.
 //   - vfsroot is not (mnt, mnt.root).
-func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry) VirtualDentry {
+func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry, toDecRef *[]refs.RefCounter) VirtualDentry {
+	decRef := func(rc refs.RefCounter) {
+		if toDecRef != nil {
+			*toDecRef = append(*toDecRef, rc)
+		} else {
+			rc.DecRef(ctx)
+		}
+	}
 	// The first mount is special-cased:
 	//
 	//	- The caller must have already checked mnt against vfsroot.
@@ -1358,12 +1372,12 @@ retryFirst:
 	if !point.TryIncRef() {
 		// Since Mount holds a reference on Mount.key.point, this can only
 		// happen due to a racing change to Mount.key.
-		parent.DecRef(ctx)
+		decRef(parent)
 		goto retryFirst
 	}
 	if !vfs.mounts.seq.ReadOk(epoch) {
-		point.DecRef(ctx)
-		parent.DecRef(ctx)
+		decRef(point)
+		decRef(parent)
 		goto retryFirst
 	}
 	mnt = parent
@@ -1385,16 +1399,16 @@ retryFirst:
 		if !point.TryIncRef() {
 			// Since Mount holds a reference on Mount.key.point, this can
 			// only happen due to a racing change to Mount.key.
-			parent.DecRef(ctx)
+			decRef(parent)
 			goto retryNotFirst
 		}
 		if !vfs.mounts.seq.ReadOk(epoch) {
-			point.DecRef(ctx)
-			parent.DecRef(ctx)
+			decRef(point)
+			decRef(parent)
 			goto retryNotFirst
 		}
-		d.DecRef(ctx)
-		mnt.DecRef(ctx)
+		decRef(d)
+		decRef(mnt)
 		mnt = parent
 		d = point
 	}
@@ -1562,6 +1576,10 @@ func (mnt *Mount) ReadOnlyLocked() bool {
 // the returned Filesystem.
 func (mnt *Mount) Filesystem() *Filesystem {
 	return mnt.fs
+}
+
+func (mnt *Mount) Internal() bool {
+	return mnt.internal
 }
 
 // submountsLocked returns this Mount and all Mounts that are descendents of

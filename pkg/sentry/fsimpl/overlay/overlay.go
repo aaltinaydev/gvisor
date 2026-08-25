@@ -145,6 +145,10 @@ type filesystem struct {
 	// is protected by dirInoCacheMu.
 	lastDirIno uint64
 
+	identityMu       identityMutex `state:"nosave"`
+	pinnedIdentities map[vfs.InodeIdentity]struct{}
+	identityOrigins  map[vfs.InodeIdentity]vfs.InodeIdentity
+
 	// MaxFilenameLen is the maximum filename length allowed by the overlayfs.
 	maxFilenameLen uint64
 }
@@ -838,6 +842,63 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie ui
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
+}
+
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	if len(d.lowerVDs) != 0 {
+		return d.lowerVDs[0].Dentry().InodeIdentity()
+	}
+	upperID := d.upperVD.Dentry().InodeIdentity()
+	d.fs.identityMu.Lock()
+	defer d.fs.identityMu.Unlock()
+	if origID, ok := d.fs.identityOrigins[upperID]; ok {
+		return origID
+	}
+	return upperID
+}
+
+func (d *dentry) PinInodeIdentity() {
+	d.copyMu.RLock()
+	defer d.copyMu.RUnlock()
+	// Pin the layer dentry that d's identity is derived from: layer inode
+	// numbers (gofer's in particular) are only stable across save/restore
+	// while the layer dentry stays alive.
+	if len(d.lowerVDs) == 0 {
+		d.upperVD.Dentry().PinInodeIdentity()
+		return
+	}
+	lowerD := d.lowerVDs[0].Dentry()
+	lowerD.PinInodeIdentity()
+	origID := lowerD.InodeIdentity()
+	if d.upperVD.Ok() {
+		d.upperVD.Dentry().PinInodeIdentity()
+	}
+
+	d.fs.identityMu.Lock()
+	defer d.fs.identityMu.Unlock()
+	if d.fs.pinnedIdentities == nil {
+		d.fs.pinnedIdentities = make(map[vfs.InodeIdentity]struct{})
+	}
+	d.fs.pinnedIdentities[origID] = struct{}{}
+	if d.upperVD.Ok() {
+		d.fs.addIdentityOriginLocked(d.upperVD.Dentry().InodeIdentity(), origID)
+	}
+}
+
+func (fs *filesystem) addIdentityOriginLocked(upperID, origID vfs.InodeIdentity) {
+	if fs.identityOrigins == nil {
+		fs.identityOrigins = make(map[vfs.InodeIdentity]vfs.InodeIdentity)
+	}
+	fs.identityOrigins[upperID] = origID
+}
+
+func (fs *filesystem) recordCopyUpIdentityOrigin(origID, upperID vfs.InodeIdentity) {
+	fs.identityMu.Lock()
+	defer fs.identityMu.Unlock()
+	if _, ok := fs.pinnedIdentities[origID]; !ok {
+		return
+	}
+	fs.addIdentityOriginLocked(upperID, origID)
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
