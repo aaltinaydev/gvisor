@@ -42,6 +42,11 @@ func (vfs *VirtualFilesystem) NewAnonVirtualDentry(name string) VirtualDentry {
 	}
 }
 
+// IsAnonVD returns true if vd belongs to anonfs.
+func (vfs *VirtualFilesystem) IsAnonVD(vd VirtualDentry) bool {
+	return vd.mount == vfs.anonMount
+}
+
 const (
 	anonfsBlockSize = hostarch.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
 
