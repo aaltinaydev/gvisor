@@ -446,6 +446,11 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+// InodeIdentity implements vfs.DentryImpl.InodeIdentity.
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	return vfs.MakeInodeIdentity(&d.inode.fs.vfsfs, d.inode.Nid())
+}
+
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 func (d *dentry) OnZeroWatches(ctx context.Context) {}
 
