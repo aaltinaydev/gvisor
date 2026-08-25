@@ -901,6 +901,17 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 		return linuxerr.EINVAL
 	}
 
+	// Landlock denies umount(2) outright, but only once the mount to unmount
+	// has been found: Linux runs the hook from [fs/namespace.c]:do_umount(),
+	// which can_umount() reaches only after rejecting a path that names no
+	// mount of ours. The denial does precede the busy check below, which
+	// do_umount() makes after calling the hook.
+	//
+	// Matches Linux [fs/namespace.c]:do_umount() calling security_sb_umount().
+	if err := CheckLandlockMount(LandlockDomainFromCredentials(creds)); err != nil {
+		return err
+	}
+
 	if opts.Flags&linux.MNT_DETACH == 0 && vfs.arePropMountsBusy(vd.mount) {
 		return linuxerr.EBUSY
 	}
