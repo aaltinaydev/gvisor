@@ -19,6 +19,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
 // The files these tests refer to, named by inode number. There is no filesystem
@@ -507,6 +508,19 @@ func TestLandlockScopeLE(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := test.tracer.ScopeLE(test.tracee); got != test.want {
 				t.Errorf("ScopeLE = %v, want %v", got, test.want)
+			}
+			// auth.LandlockCanPtrace is what kernel.Task.CanTrace calls, and it
+			// must agree, including when a domain arrives as a nil interface
+			// rather than a typed nil pointer.
+			var tracer, tracee auth.LandlockDomain
+			if test.tracer != nil {
+				tracer = test.tracer
+			}
+			if test.tracee != nil {
+				tracee = test.tracee
+			}
+			if got := auth.LandlockCanPtrace(tracer, tracee); got != test.want {
+				t.Errorf("auth.LandlockCanPtrace = %v, want %v", got, test.want)
 			}
 		})
 	}
