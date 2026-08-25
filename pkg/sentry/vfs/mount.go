@@ -474,6 +474,18 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 //
 // Roughly analogous to Linux fs/namespace.c:do_move_mount().
 func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Credentials, taskMountNs *MountNamespace, source *PathOperation, target *PathOperation) error {
+	// Lookup the target path. It is resolved before the source, as Linux's
+	// SYSCALL_DEFINE5(move_mount, ...) does, so that when both paths are bad
+	// the target's error is the one reported.
+	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{CheckSearchable: true})
+	if err != nil {
+		return err
+	}
+	targetCleanup := cleanup.Make(func() {
+		targetVd.DecRef(ctx)
+	})
+	defer targetCleanup.Clean()
+
 	// Lookup the source path
 	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{CheckSearchable: true})
 	if err != nil {
@@ -497,16 +509,6 @@ func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Crede
 	if err != nil {
 		return err
 	}
-
-	// Lookup the target path
-	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{CheckSearchable: true})
-	if err != nil {
-		return err
-	}
-	targetCleanup := cleanup.Make(func() {
-		targetVd.DecRef(ctx)
-	})
-	defer targetCleanup.Clean()
 
 	// Fetch target stat info
 	targetStat, err := vfs.StatAt(ctx, creds, &PathOperation{
@@ -907,6 +909,17 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	}
 	if vd.mount == vd.mount.ns.root {
 		return linuxerr.EINVAL
+	}
+
+	// Landlock denies umount(2) outright, but only once the mount to unmount
+	// has been found: Linux runs the hook from [fs/namespace.c]:do_umount(),
+	// which can_umount() reaches only after rejecting a path that names no
+	// mount of ours. The denial does precede the busy check below, which
+	// do_umount() makes after calling the hook.
+	//
+	// Matches Linux [fs/namespace.c]:do_umount() calling security_sb_umount().
+	if err := CheckLandlockMount(LandlockDomainFromCredentials(creds)); err != nil {
+		return err
 	}
 
 	if opts.Flags&linux.MNT_DETACH == 0 && vfs.arePropMountsBusy(vd.mount) {
