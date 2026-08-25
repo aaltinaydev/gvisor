@@ -40,6 +40,19 @@ type LandlockDomain interface {
 	ScopeLE(other LandlockDomain) bool
 }
 
+// LandlockCanPtrace reports whether a tracer restricted by the tracer domain may
+// ptrace a tracee restricted by the tracee domain. A tracer may only trace a
+// target that is confined by at least the tracer's own domain, so that a
+// sandboxed thread cannot escape by driving a less restricted one.
+//
+// Matches Linux [security/landlock/task.c]:domain_ptrace()
+func LandlockCanPtrace(tracer, tracee LandlockDomain) bool {
+	if tracer == nil {
+		return true
+	}
+	return tracer.ScopeLE(tracee)
+}
+
 // Credentials contains information required to authorize privileged operations
 // in a user namespace.
 //
