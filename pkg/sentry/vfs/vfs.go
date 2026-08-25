@@ -106,6 +106,15 @@ type VirtualFilesystem struct {
 	// lastMountNamespaceID is accessed using atomic memory operations.
 	lastMountNamespaceID atomicbitops.Uint64
 
+	// landlockInUse is whether a Landlock ruleset has ever been created. Once
+	// one has, a rule may be keyed by any file's InodeIdentity, and a
+	// FilesystemImpl whose identities could otherwise be reused must start
+	// retiring them when files are deleted; see
+	// [gofer]dentry.releaseInoOnDeletion(). It is saved, since rulesets and
+	// domains outlive a checkpoint. landlockInUse is accessed using atomic
+	// memory operations.
+	landlockInUse atomicbitops.Bool
+
 	// anonMount is a Mount, not included in mounts or mountpoints,
 	// representing an anonFilesystem. anonMount is used to back
 	// VirtualDentries returned by VirtualFilesystem.NewAnonVirtualDentry().
@@ -186,7 +195,7 @@ func (vfs *VirtualFilesystem) Init(ctx context.Context) error {
 	}
 	anonfs.vfsfs.Init(vfs, &anonFilesystemType{}, &anonfs)
 	defer anonfs.vfsfs.DecRef(ctx)
-	anonMount := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{})
+	anonMount := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{InternalMount: true})
 	vfs.anonMount = anonMount
 
 	return nil
@@ -468,6 +477,7 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 	if opts.Flags&linux.O_PATH != 0 {
 		return vfs.openOPathFD(ctx, creds, pop, opts.Flags)
 	}
+
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	if opts.Flags&linux.O_DIRECTORY != 0 {

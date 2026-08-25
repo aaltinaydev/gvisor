@@ -141,6 +141,11 @@ type Mount struct {
 	// namespace. It is analogous to MNT_LOCKED in Linux.
 	locked bool
 
+	// internal is true if this mount exists only to hold sentry-internal
+	// files and is never reachable by mounting it. It is analogous to
+	// MNT_INTERNAL in Linux. internal is immutable.
+	internal bool
+
 	// lockedFlags contains the flags that RemountAt may not clear. lockedFlags
 	// is protected by VirtualFilesystem.mountMu.
 	lockedFlags mountLockFlags
@@ -161,6 +166,7 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 		root:     root,
 		ns:       mntns,
 		locked:   opts.Locked,
+		internal: opts.InternalMount,
 		isShared: false,
 		refs:     atomicbitops.FromInt64(1),
 	}
@@ -1581,6 +1587,13 @@ func (mnt *Mount) ReadOnlyLocked() bool {
 // the returned Filesystem.
 func (mnt *Mount) Filesystem() *Filesystem {
 	return mnt.fs
+}
+
+// Internal returns true if this mount only exists to hold sentry-internal
+// files, and so is never reachable through the mount tree. It is analogous to
+// MNT_INTERNAL in Linux.
+func (mnt *Mount) Internal() bool {
+	return mnt.internal
 }
 
 // submountsLocked returns this Mount and all Mounts that are descendents of

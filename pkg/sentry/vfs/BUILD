@@ -28,6 +28,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "landlock_ruleset_mutex",
+    out = "landlock_ruleset_mutex.go",
+    package = "vfs",
+    prefix = "landlockRuleset",
+)
+
+declare_mutex(
     name = "epoll_instance_mutex",
     out = "epoll_instance_mutex.go",
     package = "vfs",
@@ -152,6 +159,8 @@ go_library(
         "inotify.go",
         "inotify_event_mutex.go",
         "inotify_mutex.go",
+        "landlock.go",
+        "landlock_ruleset_mutex.go",
         "lock.go",
         "mount.go",
         "mount_list.go",
@@ -213,6 +222,7 @@ go_test(
     size = "small",
     srcs = [
         "file_description_impl_util_test.go",
+        "landlock_test.go",
         "mount_test.go",
         "posix_acl_test.go",
     ],
