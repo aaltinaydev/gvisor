@@ -766,6 +766,13 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	if ats.MayWrite() && d.inode.fileType() == linux.S_IFREG {
 		return nil, linuxerr.EROFS
 	}
+	// d is the file the returned FileDescription will refer to, so this check
+	// cannot be raced past. The filesystem is read-only, so this is the only
+	// Landlock check it needs: every operation that would require another right
+	// fails with EROFS.
+	if err := rp.CheckLandlockOpen(ctx, &d.vfsd, opts, d.inode.IsDir()); err != nil {
+		return nil, err
+	}
 
 	switch d.inode.fileType() {
 	case linux.S_IFREG:
