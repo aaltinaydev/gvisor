@@ -1393,6 +1393,24 @@ cc_binary(
 )
 
 cc_binary(
+    name = "landlock_v1_selftests_test",
+    testonly = 1,
+    srcs = ["landlock_v1_selftests.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:capability_util",
+        "//test/util:fs_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
     name = "landlock_v2_test",
     testonly = 1,
     srcs = ["landlock_v2.cc"],
