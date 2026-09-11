@@ -613,10 +613,24 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	}
 	parent.childrenMu.Unlock()
 
-	// Load child if sticky bit is set because we need to determine whether
-	// deletion is allowed.
+	// Load child if the sticky bit is set, because we need to determine whether
+	// deletion is allowed, or if the path had a trailing slash, because the
+	// errno that produces depends on the child's type and Linux reports it
+	// before consulting an LSM. Otherwise the unlink RPC does the existence
+	// check.
+	//
+	// The victim is looked up with getChildLocked(), not stepLocked():
+	// unlink(2) acts on the dentry in this filesystem even if it is
+	// overmounted, as Linux's __lookup_hash() does not follow mounts, and
+	// stepLocked()'s CheckMount() would return resolveMountPointError for a
+	// mount point, which VFS would mistake for mount traversal, consume the
+	// final path component, and re-dispatch UnlinkAt with an exhausted path.
+	// An overmounted victim instead fails PrepareDeleteDentry() below with
+	// EBUSY, as vfs_unlink()'s is_local_mountpoint() check does.
+	sticky := parent.inode.mode.Load()&linux.ModeSticky != 0
+	trailingSlash := !dir && rp.MustBeDir()
 	var child *dentry
-	if parent.inode.mode.Load()&linux.ModeSticky == 0 {
+	if !sticky && !trailingSlash {
 		var ok bool
 		parent.childrenMu.Lock()
 		child, ok = parent.children[name]
@@ -626,10 +640,26 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 			return linuxerr.ENOENT
 		}
 	} else {
-		child, _, err = fs.stepLocked(ctx, resolvingPathFull(rp), parent, false /* mayFollowSymlinks */, &ds)
+		child, err = fs.getChildLocked(ctx, parent, name, &ds)
 		if err != nil {
 			return err
 		}
+	}
+	// A trailing slash is rejected before the LSM hook by
+	// filename_unlinkat()'s "Why not before? Because we want correct error
+	// value" check; the plain directory case is rejected after it, by
+	// may_delete().
+	if trailingSlash {
+		if child.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
+	}
+
+	// Linux reaches may_delete(), which is where the sticky bit's EPERM comes
+	// from, only from inside vfs_unlink() and vfs_rmdir(), after the lookup
+	// of the victim and after security_path_unlink() and security_path_rmdir().
+	if sticky {
 		if err := parent.mayDelete(rp.Credentials(), child); err != nil {
 			return err
 		}
@@ -690,12 +720,6 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		if child != nil && child.isDir() {
 			vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
 			return linuxerr.EISDIR
-		}
-		if rp.MustBeDir() {
-			if child != nil {
-				vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
-			}
-			return linuxerr.ENOTDIR
 		}
 	}
 	if parent.inode.isSynthetic() {
@@ -827,14 +851,17 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return nil, linuxerr.EXDEV
 		}
 		d := vd.Dentry().Impl().(*dentry)
-		if d.isDir() {
-			return nil, linuxerr.EPERM
-		}
+		// do_linkat() calls may_linkat() before vfs_link(), so a source the
+		// protected_hardlinks policy refuses is reported as EPERM before a
+		// directory source is.
 		gid := auth.KGID(d.inode.gid.Load())
 		uid := auth.KUID(d.inode.uid.Load())
 		mode := linux.FileMode(d.inode.mode.Load())
 		if err := vfs.MayLink(rp.Credentials(), mode, nil, uid, gid); err != nil {
 			return nil, err
+		}
+		if d.isDir() {
+			return nil, linuxerr.EPERM
 		}
 		if d.inode.nlink.Load() == 0 {
 			return nil, linuxerr.ENOENT
@@ -1094,6 +1121,11 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	ats := vfs.AccessTypesForOpenFlags(opts)
 
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+		return nil, err
+	}
+	// Linux rejects these before the hook the Landlock check below matches, so
+	// a file that cannot be opened at all still reports why.
+	if err := vfs.CheckOpenFileType(linux.FileMode(d.inode.fileType()), opts); err != nil {
 		return nil, err
 	}
 	if !d.inode.isSynthetic() {
@@ -1429,16 +1461,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	// Support flags:
-	// - RENAME_NOREPLACE
-	// - RENAME_EXCHANGE
-	if opts.Flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) != 0 {
-		return linuxerr.EINVAL
-	}
-
-	// RENAME_NOREPLACE can't be employed together with RENAME_EXCHANGE.
-	if opts.Flags&(linux.RENAME_EXCHANGE|linux.RENAME_NOREPLACE) == linux.RENAME_EXCHANGE|linux.RENAME_NOREPLACE {
-		return linuxerr.EINVAL
+	if err := vfs.CheckRenameFlags(opts.Flags); err != nil {
+		return err
 	}
 	if fs.opts.interop == InteropModeShared && opts.Flags&linux.RENAME_NOREPLACE != 0 {
 		// Requires 9P support to synchronize with other remote filesystem
@@ -1493,17 +1517,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil {
 		return err
 	}
-	if err := oldParent.mayDelete(creds, renamed); err != nil {
-		return err
-	}
 	if renamed.isDir() {
 		if renamed == newParent || genericIsAncestorDentry(fs, renamed, newParent) {
 			return linuxerr.EINVAL
-		}
-		if oldParent != newParent {
-			if err := renamed.checkPermissions(creds, vfs.MayWrite); err != nil {
-				return err
-			}
 		}
 	} else {
 		if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
@@ -1512,9 +1528,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	if oldParent != newParent {
-		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
-			return err
-		}
 		newParent.opMu.Lock()
 		defer newParent.opMu.Unlock()
 	}
@@ -1530,23 +1543,53 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
 			return linuxerr.EEXIST
 		}
+		replacedVFSD = &replaced.vfsd
+	} else if exchange {
+		// RENAME_EXCHANGE needs a destination; do_renameat2() reports the
+		// missing one as ENOENT from its lookup, before the hook.
+		return linuxerr.ENOENT
+	}
+	if replaced != nil && exchange {
+		// The exchanged files may differ in type, and a directory being
+		// exchanged may be non-empty; but exchanging a file with an
+		// ancestor directory would disconnect the latter from the tree.
+		// do_renameat2() makes these checks before the hook.
+		if genericIsAncestorDentry(fs, replaced, renamed) {
+			return linuxerr.EINVAL
+		}
+		if rp.MustBeDir() && !replaced.isDir() {
+			return linuxerr.ENOTDIR
+		}
+		if opts.MustBeDir && !renamed.isDir() {
+			return linuxerr.ENOTDIR
+		}
+	}
+
+	if opts.Flags&linux.RENAME_WHITEOUT != 0 {
+		// TODO(b/145974740): Support RENAME_WHITEOUT. Rejected only here
+		// because Linux reaches a filesystem's own rejection of it from
+		// vfs_rename(), after the hook above.
+		return linuxerr.EINVAL
+	}
+
+	if err := oldParent.mayDelete(creds, renamed); err != nil {
+		return err
+	}
+	if renamed.isDir() && oldParent != newParent {
+		if err := renamed.checkPermissions(creds, vfs.MayWrite); err != nil {
+			return err
+		}
+	}
+	if oldParent != newParent {
+		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
+		}
+	}
+	if replaced != nil {
 		if err := newParent.mayDelete(creds, replaced); err != nil {
 			return err
 		}
-		replacedVFSD = &replaced.vfsd
 		if exchange {
-			// The exchanged files may differ in type, and a directory being
-			// exchanged may be non-empty; but exchanging a file with an
-			// ancestor directory would disconnect the latter from the tree.
-			if genericIsAncestorDentry(fs, replaced, renamed) {
-				return linuxerr.EINVAL
-			}
-			if rp.MustBeDir() && !replaced.isDir() {
-				return linuxerr.ENOTDIR
-			}
-			if opts.MustBeDir && !renamed.isDir() {
-				return linuxerr.ENOTDIR
-			}
 			if oldParent != newParent && replaced.isDir() {
 				// Writability is needed to change replaced's "..".
 				if err := replaced.checkPermissions(creds, vfs.MayWrite); err != nil {
@@ -1564,11 +1607,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if rp.MustBeDir() || renamed.isDir() {
 				return linuxerr.ENOTDIR
 			}
-		}
-	} else { // replaced == nil
-		if exchange {
-			// RENAME_EXCHANGE requires that the target file exist.
-			return linuxerr.ENOENT
 		}
 	}
 
