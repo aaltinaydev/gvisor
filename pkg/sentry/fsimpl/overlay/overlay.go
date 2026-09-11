@@ -149,9 +149,14 @@ type filesystem struct {
 	// is protected by dirInoCacheMu.
 	lastDirIno uint64
 
-	// identityMu protects identityInos and lastIdentityIno. See
-	// dentry.InodeIdentity().
-	identityMu identityMutex `state:"nosave"`
+	// pinnedIdentities is the set of identities that dentry.InodeIdentity() has
+	// been asked to keep naming the same file, and identityOrigins maps the
+	// identity of a copy in the upper layer back to the pinned identity the
+	// file had before it was copied up. Both are protected by identityMu. See
+	// dentry.PinInodeIdentity().
+	identityMu       identityMutex `state:"nosave"`
+	pinnedIdentities map[vfs.InodeIdentity]struct{}
+	identityOrigins  map[vfs.InodeIdentity]vfs.InodeIdentity
 
 	// identityInos maps the identity of the layer file that an overlay file's
 	// identity is derived from to the inode number identifying that overlay
@@ -885,9 +890,13 @@ func (d *dentry) Watches() *vfs.Watches {
 //
 // d.lowerVDs is immutable, so its first entry, the topmost lower layer on which
 // the file exists, answers for as long as this dentry lives, whether or not it
-// is copied up. A dentry instantiated after a copy-up cannot see that layer,
-// because lookupLocked() stops at the topmost layer holding a non-directory, so
-// it answers with the upper layer's identity instead.
+// is copied up. It cannot answer for a dentry instantiated after a copy-up,
+// because lookupLocked() stops at the topmost layer holding a non-directory and
+// so never sees the lower copy; such a dentry falls back to the upper layer's
+// identity, and fs.identityOrigins translates it back for the files a caller
+// has pinned. Directories usually keep their lower layers, being merged, but a
+// renamed one does not: the rename happens on the upper layer only, so a lookup
+// at the new name is upper-only and takes the same fs.identityOrigins fallback.
 //
 // fs.identityInos gains one entry per distinct file whose identity is asked
 // for, which under a Landlock domain is every file an access check walks
@@ -895,7 +904,8 @@ func (d *dentry) Watches() *vfs.Watches {
 // This is the same growth as the gofer's inoByKey.
 func (d *dentry) InodeIdentity() vfs.InodeIdentity {
 	var layerID vfs.InodeIdentity
-	if len(d.lowerVDs) == 0 {
+	upperOnly := len(d.lowerVDs) == 0
+	if upperOnly {
 		// d has only an upper layer, either because it was created there or
 		// because it was copied up before this dentry was instantiated.
 		// d.upperVD is immutable in both cases.
@@ -908,6 +918,11 @@ func (d *dentry) InodeIdentity() vfs.InodeIdentity {
 	}
 	d.fs.identityMu.Lock()
 	defer d.fs.identityMu.Unlock()
+	if upperOnly {
+		if origID, ok := d.fs.identityOrigins[layerID]; ok {
+			layerID = origID
+		}
+	}
 	ino, ok := d.fs.identityInos[layerID]
 	if !ok {
 		if d.fs.identityInos == nil {
@@ -918,6 +933,77 @@ func (d *dentry) InodeIdentity() vfs.InodeIdentity {
 		d.fs.identityInos[layerID] = ino
 	}
 	return vfs.MakeInodeIdentity(&d.fs.vfsfs, ino)
+}
+
+// PinInodeIdentity implements vfs.Dentry.PinInodeIdentity.
+//
+// The caller is about to remember d's identity for longer than d itself will
+// live, so d's filesystem must go on returning it for this file. That takes
+// two things. The identity-providing layer dentries must be pinned in turn:
+// layer inode numbers (gofer's in particular) are only stable across
+// save/restore while the layer dentry stays alive. And a copy-up, which
+// replaces the file the identity comes from with a copy in another filesystem,
+// needs bookkeeping so the copy keeps answering with the original identity;
+// only files with a lower layer cost that, and only those a caller has pinned.
+func (d *dentry) PinInodeIdentity() {
+	// Held for writing by copy-up while it installs d.upperVD, so d cannot be
+	// copied up between the test below and the record.
+	d.copyMu.RLock()
+	defer d.copyMu.RUnlock()
+	// Pin the layer dentry that d's identity is derived from: layer inode
+	// numbers (gofer's in particular) are only stable across save/restore
+	// while the layer dentry stays alive.
+	if len(d.lowerVDs) == 0 {
+		// Nothing but the upper layer to name the file by, now or ever.
+		d.upperVD.Dentry().PinInodeIdentity()
+		return
+	}
+	lowerD := d.lowerVDs[0].Dentry()
+	lowerD.PinInodeIdentity()
+	origID := lowerD.InodeIdentity()
+	if d.upperVD.Ok() {
+		// d was already copied up. The upper file's identity is what dentries
+		// instantiated after this one is dropped will fall back to, so it must
+		// stay stable too.
+		d.upperVD.Dentry().PinInodeIdentity()
+	}
+
+	d.fs.identityMu.Lock()
+	defer d.fs.identityMu.Unlock()
+	if d.fs.pinnedIdentities == nil {
+		d.fs.pinnedIdentities = make(map[vfs.InodeIdentity]struct{})
+	}
+	d.fs.pinnedIdentities[origID] = struct{}{}
+	if d.upperVD.Ok() {
+		// d was already copied up, so record the origin now: copy-up will not
+		// run again to do it.
+		d.fs.addIdentityOriginLocked(d.upperVD.Dentry().InodeIdentity(), origID)
+	}
+}
+
+// addIdentityOriginLocked makes InodeIdentity() report origID for a dentry that
+// has only the upper-layer file identified by upperID.
+//
+// Preconditions: fs.identityMu must be locked.
+func (fs *filesystem) addIdentityOriginLocked(upperID, origID vfs.InodeIdentity) {
+	if fs.identityOrigins == nil {
+		fs.identityOrigins = make(map[vfs.InodeIdentity]vfs.InodeIdentity)
+	}
+	fs.identityOrigins[upperID] = origID
+}
+
+// recordCopyUpIdentityOrigin notes that the file whose identity was origID has
+// been copied up to the file whose identity is upperID, so that a dentry
+// instantiated later, which will see only the upper layer, still reports
+// origID. Nothing is recorded for a file whose identity nobody pinned, since
+// nothing is left to notice the difference.
+func (fs *filesystem) recordCopyUpIdentityOrigin(origID, upperID vfs.InodeIdentity) {
+	fs.identityMu.Lock()
+	defer fs.identityMu.Unlock()
+	if _, ok := fs.pinnedIdentities[origID]; !ok {
+		return
+	}
+	fs.addIdentityOriginLocked(upperID, origID)
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
