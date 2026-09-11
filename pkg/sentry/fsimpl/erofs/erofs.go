@@ -753,12 +753,22 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
+	// Linux rejects these before the hook the Landlock check below matches, so
+	// a file that cannot be opened at all still reports why.
+	if err := vfs.CheckOpenFileType(linux.FileMode(d.inode.fileType()), opts); err != nil {
+		return nil, err
+	}
+	// Likewise for the read-only filesystem, which Linux reports from the
+	// inode_permission() inside may_open(). Only regular files are rejected
+	// here: sb_permission() lets a device node, fifo or socket on a read-only
+	// filesystem be opened for writing, and a directory or symlink has already
+	// been turned away above.
+	if ats.MayWrite() && d.inode.fileType() == linux.S_IFREG {
+		return nil, linuxerr.EROFS
+	}
 
 	switch d.inode.fileType() {
 	case linux.S_IFREG:
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EROFS
-		}
 		var fd regularFileFD
 		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Credentials(), rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{AllowDirectIO: true}); err != nil {
