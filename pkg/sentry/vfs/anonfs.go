@@ -357,5 +357,13 @@ func (d *anonDentry) Watches() *Watches {
 	return &d.watches
 }
 
+// InodeIdentity implements DentryImpl.InodeIdentity.
+//
+// Anonymous inodes have no identity: no path names them, so they never appear
+// in a path walk.
+func (d *anonDentry) InodeIdentity() InodeIdentity {
+	return InodeIdentity{}
+}
+
 // OnZeroWatches implements Dentry.OnZeroWatches.
 func (d *anonDentry) OnZeroWatches(context.Context) {}

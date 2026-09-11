@@ -43,6 +43,11 @@ type Filesystem struct {
 	// fsType is the FilesystemType of this Filesystem.
 	fsType FilesystemType
 
+	// id uniquely identifies this Filesystem for as long as the sentry runs.
+	// Unlike a device number, it is never reused after the Filesystem is
+	// destroyed. See InodeIdentity. id is immutable.
+	id uint64
+
 	// impl is the FilesystemImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in Dentry.
 	impl FilesystemImpl
@@ -53,6 +58,7 @@ func (fs *Filesystem) Init(vfsObj *VirtualFilesystem, fsType FilesystemType, imp
 	fs.InitRefs()
 	fs.vfs = vfsObj
 	fs.fsType = fsType
+	fs.id = vfsObj.lastFilesystemID.Add(1)
 	fs.impl = impl
 	vfsObj.filesystemsMu.Lock()
 	vfsObj.filesystems[fs] = struct{}{}

@@ -19,6 +19,66 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 )
 
+// InodeIdentity identifies the file underlying a Dentry, in the sense in which
+// Linux's struct inode identifies a file. Two Dentries have equal identities
+// exactly when they name the same file, whether they reach it as hard links to
+// each other, through different mounts of the same filesystem, or through the
+// same path before and after a rename.
+//
+// The zero value is the "no identity" value, for which Ok returns false. It is
+// returned for Dentries whose filesystem cannot name the underlying file, which
+// as of this writing means only anonymous inodes; no path reaches those, so
+// they never appear in a path walk.
+//
+// InodeIdentity is comparable, so it can be used as a map key. Its components
+// are filesystem-defined and are not necessarily the ones that stat(2) reports,
+// so identities are only meaningful when compared against each other.
+//
+// +stateify savable
+type InodeIdentity struct {
+	ok   bool
+	fsID uint64
+	ino  uint64
+}
+
+// MakeInodeIdentity returns the InodeIdentity of the file on fs identified by
+// ino.
+//
+// ino need not be the inode number that stat(2) reports; it need only identify
+// the file uniquely within its filesystem. It must, however, be stable across
+// destruction and re-instantiation of the Dentries naming the file, since
+// Dentries are cached and callers hold identities for longer than a Dentry
+// necessarily lives. In particular, a pointer to a cached per-inode structure
+// is not a valid ino.
+//
+// The identity is scoped to fs because an inode number only names a file
+// within its own filesystem. Device numbers, which is how stat(2) tells
+// filesystems apart, would not be a safe scope: they are recycled, since an
+// anonymous block device minor is returned to the pool when its filesystem is
+// destroyed, and the next filesystem to be created may be given the same one.
+// An identity held from the destroyed filesystem could then come to match a
+// file on the new one. fs identifies the filesystem for as long as the sentry
+// runs, so identities from distinct filesystems never collide even if their
+// device numbers do.
+func MakeInodeIdentity(fs *Filesystem, ino uint64) InodeIdentity {
+	return InodeIdentity{
+		ok:   true,
+		fsID: fs.id,
+		ino:  ino,
+	}
+}
+
+// Ok returns whether id identifies a file.
+func (id InodeIdentity) Ok() bool {
+	return id.ok
+}
+
+// InodeIdentity returns the identity of the file underlying d, which may be the
+// zero InodeIdentity if d's filesystem cannot name it.
+func (d *Dentry) InodeIdentity() InodeIdentity {
+	return d.impl.InodeIdentity()
+}
+
 // WalkAncestors calls fn on vd's Dentry and then on each of its ancestors, from
 // vd upward toward the root of vd's mount namespace, crossing mount boundaries
 // as it goes. The walk stops when fn returns false, or when it reaches a mount

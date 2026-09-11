@@ -33,6 +33,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "identity_mutex",
+    out = "identity_mutex.go",
+    package = "overlay",
+    prefix = "identity",
+)
+
+declare_mutex(
     name = "dir_cache_mutex",
     out = "dir_cache_mutex.go",
     package = "overlay",
@@ -107,6 +114,7 @@ go_library(
         "directory.go",
         "filesystem.go",
         "fstree.go",
+        "identity_mutex.go",
         "maps_mutex.go",
         "overlay.go",
         "regular_file.go",

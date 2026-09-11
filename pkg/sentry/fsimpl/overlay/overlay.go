@@ -28,6 +28,10 @@
 //		        *** "memmap.Mappable locks taken by Translate" below this point
 //		        dentry.dataMu
 //		      filesystem.ancestryMu
+//		        filesystem.identityMu (a leaf: also lockable directly under
+//		          dentry.copyMu or dentry.mapsMu, since InodeIdentity() runs
+//		          both under WalkAncestors()'s ancestryMu read lock and
+//		          without it)
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -144,6 +148,17 @@ type filesystem struct {
 	// lastDirIno is the last inode number assigned to a directory. lastDirIno
 	// is protected by dirInoCacheMu.
 	lastDirIno uint64
+
+	// identityMu protects identityInos and lastIdentityIno. See
+	// dentry.InodeIdentity().
+	identityMu identityMutex `state:"nosave"`
+
+	// identityInos maps the identity of the layer file that an overlay file's
+	// identity is derived from to the inode number identifying that overlay
+	// file within this filesystem, and lastIdentityIno is the last number
+	// handed out. Both are protected by identityMu. See dentry.InodeIdentity().
+	identityInos    map[vfs.InodeIdentity]uint64
+	lastIdentityIno uint64
 
 	// MaxFilenameLen is the maximum filename length allowed by the overlayfs.
 	maxFilenameLen uint64
@@ -841,6 +856,68 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie ui
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
+}
+
+// InodeIdentity implements vfs.DentryImpl.InodeIdentity.
+//
+// The identity is scoped to this overlay and derived from the file in a layer.
+// Neither of the two more obvious candidates works:
+//
+//   - The device and inode numbers overlayfs synthesizes and reports from Stat
+//     are not stable: d.ino is rewritten to the upper file's when d is copied
+//     up, and the numbers synthesized for directories come from
+//     fs.dirInoCache, whose entries are dropped along with the dentries holding
+//     them and reallocated from a counter on the next lookup.
+//
+//   - The layer file's own identity is stable, but reporting it as-is would
+//     make the overlay file and the layer file one file to a rule: a rule added
+//     on a merged directory would also cover the lower directory it is built
+//     from, wherever that is reachable, and a rule on the lower directory would
+//     cover the merged one. In Linux those are distinct inodes, which the
+//     Landlock selftest layout2_overlay.same_content_different_file relies on.
+//     So the layer identity serves only as a key, translated through
+//     fs.identityInos into a number that is unique within this overlay.
+//
+// The layer chosen has to be one that two dentries naming the same file agree
+// on, including two instantiated at different times: a Landlock rule outlives
+// the dentry it was added on, so an identity that changed when the dentry was
+// dropped and looked up again would silently stop matching.
+//
+// d.lowerVDs is immutable, so its first entry, the topmost lower layer on which
+// the file exists, answers for as long as this dentry lives, whether or not it
+// is copied up. A dentry instantiated after a copy-up cannot see that layer,
+// because lookupLocked() stops at the topmost layer holding a non-directory, so
+// it answers with the upper layer's identity instead.
+//
+// fs.identityInos gains one entry per distinct file whose identity is asked
+// for, which under a Landlock domain is every file an access check walks
+// through, and never loses one, since a rule may name any of them indefinitely.
+// This is the same growth as the gofer's inoByKey.
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	var layerID vfs.InodeIdentity
+	if len(d.lowerVDs) == 0 {
+		// d has only an upper layer, either because it was created there or
+		// because it was copied up before this dentry was instantiated.
+		// d.upperVD is immutable in both cases.
+		layerID = d.upperVD.Dentry().InodeIdentity()
+	} else {
+		layerID = d.lowerVDs[0].Dentry().InodeIdentity()
+	}
+	if !layerID.Ok() {
+		return vfs.InodeIdentity{}
+	}
+	d.fs.identityMu.Lock()
+	defer d.fs.identityMu.Unlock()
+	ino, ok := d.fs.identityInos[layerID]
+	if !ok {
+		if d.fs.identityInos == nil {
+			d.fs.identityInos = make(map[vfs.InodeIdentity]uint64)
+		}
+		d.fs.lastIdentityIno++
+		ino = d.fs.lastIdentityIno
+		d.fs.identityInos[layerID] = ino
+	}
+	return vfs.MakeInodeIdentity(&d.fs.vfsfs, ino)
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.

@@ -1701,6 +1701,16 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+// InodeIdentity implements vfs.DentryImpl.InodeIdentity.
+//
+// inode.ino is used rather than inode.inoKey because it is unique for synthetic
+// inodes, which have no inoKey, while still being shared between dentries that
+// are hard links to the same remote file: fs.inoFromKey() assigns one ino per
+// inoKey.
+func (d *dentry) InodeIdentity() vfs.InodeIdentity {
+	return vfs.MakeInodeIdentity(&d.inode.fs.vfsfs, d.inode.ino)
+}
+
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 //
 // If no watches are left on this dentry and it has no references, cache it.
