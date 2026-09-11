@@ -79,6 +79,38 @@ func (d *Dentry) InodeIdentity() InodeIdentity {
 	return d.impl.InodeIdentity()
 }
 
+// inodeIdentityPinner is an optional interface implemented by DentryImpls whose
+// identities are not naturally stable for the lifetime of the filesystem.
+type inodeIdentityPinner interface {
+	// PinInodeIdentity asks the FilesystemImpl to keep returning the current
+	// identity for the file underlying the Dentry for as long as the file
+	// exists, at whatever cost that carries.
+	PinInodeIdentity()
+}
+
+// PinInodeIdentity tells d's filesystem that d's identity is about to be
+// remembered, so that it must keep naming the same file afterwards even if the
+// filesystem's own idea of that file changes.
+//
+// Two filesystems need this. The gofer mints sentry inode numbers on lookup and
+// forgets them when a dentry is evicted, so it pins the dentry to keep the
+// number. The overlay switches, on copy-up, to a copy that lives in a different
+// filesystem with an inode number of its own, which a Dentry instantiated after
+// the copy-up cannot see past, so it records the correspondence and pins the
+// layer dentries its identity comes from. Linux has nothing to do here because
+// a Landlock rule takes a reference to the inode itself, which outlives any
+// dentry naming it; gVisor has no such inode to hold, so the filesystem is told
+// instead.
+//
+// Callers must call this before recording an identity that later checks have to
+// agree with, which as of this writing means adding a Landlock rule. The caller
+// must hold a reference on d.
+func (d *Dentry) PinInodeIdentity() {
+	if pinner, ok := d.impl.(inodeIdentityPinner); ok {
+		pinner.PinInodeIdentity()
+	}
+}
+
 // WalkAncestors calls fn on vd's Dentry and then on each of its ancestors, from
 // vd upward toward the root of vd's mount namespace, crossing mount boundaries
 // as it goes. The walk stops when fn returns false, or when it reaches a mount

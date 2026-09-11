@@ -285,8 +285,11 @@ func (fs *filesystem) getRemoteChildLocked(ctx context.Context, parent *dentry, 
 			child.inode.refs.DecRef(func() {
 				destroyInode = true
 				if !child.isDir() {
-					// Only non-directory inodes are cached in inodeByKey.
-					delete(fs.inodeByKey, child.inode.inoKey)
+					// Only non-directory inodes are cached in inodeByKey. The
+					// entry is compared first, as in dentry.destroyLocked().
+					if cached, ok := fs.inodeByKey[child.inode.inoKey]; ok && cached == child.inode {
+						delete(fs.inodeByKey, child.inode.inoKey)
+					}
 				}
 			})
 			fs.inodeMu.Unlock()
@@ -723,6 +726,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		toDecRef = vfsObj.CommitDeleteDentry(ctx, &child.vfsd) // +checklocksforce: see above.
 		child.setDeleted()
 		child.decLinks()
+		child.releaseInoOnDeletion()
 		// If an extra reference is held on child as described by the comment
 		// for dentry.refs, drop that reference now. We can't race with another
 		// fs.unlinkAt() or invalidation since parent.opMu has been locked for
@@ -1666,6 +1670,11 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	if replaced != nil {
 		replaced.setDeleted()
+		// The rename removed replaced's name, exactly as an unlink would
+		// have: its link count drops, and with the last link gone its
+		// inode number is retired so a later file cannot inherit it.
+		replaced.decLinks()
+		replaced.releaseInoOnDeletion()
 		// If an extra reference is held on replaced as described by the
 		// comment for dentry.refs, drop that reference now. We can't race with
 		// fs.unlinkAt() or invalidation since fs.renameMu has been locked for
